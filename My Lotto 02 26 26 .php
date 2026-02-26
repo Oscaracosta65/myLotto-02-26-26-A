@@ -2051,10 +2051,22 @@ function getDrawFields($gameId)
  * @param  array       $configData   Parsed lottery_skip_config.json
  * @return string                    e.g. "Powerball", "Mega Ball", "Extra Ball"
  */
-function getExtraBallLabel($gameId, string $lotteryName, array $configData = []): string
+function getExtraBallLabel(int $gameId, string $lotteryName, array $configData = []): string
 {
-    // TODO: implement
-        return 'Extra Ball';
+    // Check config data first (most reliable source)
+    if (!empty($configData['lotteries'][$gameId]['lotteryConfig']['extra_ball_label'])) {
+        return (string) $configData['lotteries'][$gameId]['lotteryConfig']['extra_ball_label'];
+    }
+    // Heuristic fallback by lottery name
+    $lname = strtolower((string) $lotteryName);
+    if (strpos($lname, 'powerball') !== false)      return 'Powerball';
+    if (strpos($lname, 'mega') !== false)           return 'Mega Ball';
+    if (strpos($lname, 'lucky star') !== false)     return 'Lucky Star';
+    if (strpos($lname, 'star ball') !== false)      return 'Star Ball';
+    if (strpos($lname, 'bonus ball') !== false)     return 'Bonus Ball';
+    if (strpos($lname, 'bonus') !== false)          return 'Bonus';
+    if (strpos($lname, 'match 6') !== false)        return 'Bonus Ball';
+    return 'Extra Ball';
 }
 
 /**
@@ -2231,6 +2243,32 @@ function scoreRunAgainstDraw($db, $gameId, $drawDate, array $predMain, $predExtr
                 $v = (int)$draw[$col];
                 if ($v) $drawMain[] = $v;
             }
+        }
+    }
+    // Fallback: auto-detect ball columns when config is missing or incomplete.
+    // Excludes known non-ball columns (id, dates, jackpot, etc.) and collects
+    // positive integers that are likely lottery ball numbers.
+    if (empty($drawMain) && !$hasNormMain && empty($mainCols)) {
+        static $__skipCols = [
+            'id', 'game_id', 'lottery_id', 'game_type', 'draw_date', 'date',
+            'created_at', 'updated_at', 'published_date', 'publish_up', 'publish_down',
+            'jackpot', 'multiplier', 'powerplay', 'megaplier', 'cash_option',
+            'next_jackpot', 'sales', 'winners', 'prize', 'state_id', 'checked_out',
+        ];
+        $__candidateCols = [];
+        foreach ($draw as $__colName => $__colVal) {
+            if (in_array(strtolower((string)$__colName), $__skipCols, true)) continue; // $__skipCols values are pre-lowercased
+            // Only include columns with a clean positive integer value in ball range (1-99)
+            $__cleanVal = trim((string)$__colVal);
+            $__intVal = ctype_digit($__cleanVal) ? (int)$__cleanVal : 0;
+            if ($__intVal > 0 && $__intVal <= 99) { // 99 = safe max for standard lottery ball numbers
+                $__candidateCols[$__colName] = $__intVal;
+            }
+        }
+        // Sort by column name to get a stable ordering
+        ksort($__candidateCols);
+        foreach ($__candidateCols as $__cv) {
+            $drawMain[] = $__cv;
         }
     }
 
@@ -2606,7 +2644,7 @@ foreach ($groups as $g) {
 
     for ($i = 0; $i < $maxMain; $i++) {
         if (!empty($tableInfo[$tblKeyInt]['main'][$i])) {
-            // Alias each main ball column to a normalized name: main_0, main_1, …
+            // Alias each main ball column to a normalized name: main_0, main_1, &hellip;
             $cols[] = $db->quoteName($tableInfo[$tblKeyInt]['main'][$i]) . ' AS main_' . $i; // CHANGED: added alias
         } else {
             $cols[] = 'NULL AS main_' . $i;
@@ -4493,7 +4531,7 @@ uksort($__crrPresentSrcs, function ($a, $b) use ($__crrSourceOrder) {
   [[/span]]
 
   <?php if ($state && $state !== 'Lottery'): ?>
-    &nbsp;•&nbsp;
+    &nbsp;&bull;&nbsp;
     [[span class="lottery-name"]]
       <?php echo htmlspecialchars($state, ENT_QUOTES); ?>
     [[/span]]
@@ -4512,13 +4550,13 @@ uksort($__crrPresentSrcs, function ($a, $b) use ($__crrSourceOrder) {
 ?>
 
 <?php if (!empty($lotName)): ?>
-  &nbsp;•&nbsp;
+  &nbsp;&bull;&nbsp;
   [[span class="lottery-name"]]
     <?php echo htmlspecialchars($lotName, ENT_QUOTES); ?>
   [[/span]]
 <?php endif; ?>
 
-  &nbsp;•&nbsp;
+  &nbsp;&bull;&nbsp;
   <?php
     $ts = strtotime((string) ($g['draw_date'] ?? ''));
     echo $ts ? date('M j, Y', $ts) : htmlspecialchars((string) ($g['draw_date'] ?? ''), ENT_QUOTES);
@@ -4628,9 +4666,7 @@ $__drawExtra = [];
 
 if ($__drawRow) {
 
-$__mode = (!empty($__drawMain)) ? 'post' : 'pre';
-
-  // If row came from $drawMap, normalized fields exist (main_0, main_1, …, extra_ball)
+  // If row came from $drawMap, normalized fields exist (main_0, main_1, &hellip;, extra_ball)
   $hasNormalizedMains = array_key_exists('main_0', $__drawRow);
 
   if ($hasNormalizedMains) {
@@ -4665,6 +4701,8 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
       }
   }
 }
+// Set mode AFTER draw data is populated (post = draw results available, pre = upcoming draw)
+$__mode = (!empty($__drawMain)) ? 'post' : 'pre';
 
         // Limits: up to 20 main ranks, up to 5 extra ranks (safe defaults)
         $__maxRankMain  = 20;
@@ -5849,10 +5887,10 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
     [[br]][[br]]
     [[strong]]How to read it:[[/strong]]
     [[br]]
-    • The [[strong]]red side on the left (low rank numbers)[[/strong]] shows early picks.  
-    • The [[strong]]blue side on the right (high rank numbers)[[/strong]] shows later picks.  
-    • Darker cells mean [[em]]more hits[[/em]] at that rank.  
-    • Gold-outlined cells mark each method's current [[em]]"sweet-spot" ranks[[/em]].
+    &bull; The [[strong]]red side on the left (low rank numbers)[[/strong]] shows early picks.  
+    &bull; The [[strong]]blue side on the right (high rank numbers)[[/strong]] shows later picks.  
+    &bull; Darker cells mean [[em]]more hits[[/em]] at that rank.  
+    &bull; Gold-outlined cells mark each method's current [[em]]"sweet-spot" ranks[[/em]].
     [[br]][[br]]
 
 
@@ -5990,7 +6028,7 @@ $peakCols = array_values(array_filter($peakCols, function ($k) use ($placementSt
     [[span style="display:inline-block; width:16px; height:10px; background:#FF0000; margin-right:.35rem;"]][[/span]] Rank #1 (hot)
     &nbsp;?&nbsp;
     [[span style="display:inline-block; width:16px; height:10px; background:#0000FF; margin:0 .35rem 0 .55rem;"]][[/span]] Rank #<?php echo $__maxRankMain; ?> (cool)
-    &nbsp;•&nbsp; Gold outline = peak columns for that method
+    &nbsp;&bull;&nbsp; Gold outline = peak columns for that method
   [[/div]]
   
   <?php
@@ -6080,7 +6118,7 @@ $peakCols = array_values(array_filter($peakCols, function ($k) use ($placementSt
 
   [[div style="font-size:0.85rem; color:#4a5568; line-height:1.4;"]]
     [[strong]]Per-method pattern:[[/strong]]
-    [[em]]<?php echo htmlspecialchars(implode('  •  ', $perMethodSummaries), ENT_QUOTES); ?>[[/em]]
+    [[em]]<?php echo htmlspecialchars(implode('  &bull;  ', $perMethodSummaries), ENT_QUOTES); ?>[[/em]]
     [[br]]
     [[span style="opacity:0.9;"]]
       Tip: Aim to match more of your chosen numbers where methods score early (ranks #1-#5), and use later ranks as secondary numbers.
@@ -6734,7 +6772,7 @@ if ($__rawSettingsJson !== null):
   [[input type="text"
           name="setting_name"
           value="<?php echo $defaultName; ?>"
-          placeholder="Save as template…"
+          placeholder="Save as template&hellip;"
           style="width:100%; padding:6px; margin-bottom:6px; font-size:.9rem;"]]
 
   [[button type="submit" class="btn-primary"
@@ -6845,7 +6883,7 @@ $savedSettings = $db->loadAssocList() ?: [];
             $sourceLabel = ucfirst(str_replace('_', ' ', $set['source']));
             $state       = htmlspecialchars($set['state_name'] ?? 'Unknown', ENT_QUOTES);
             $lotteryName = htmlspecialchars($set['lottery_name'] ?? 'Unknown', ENT_QUOTES);
-            echo "$sourceLabel for $state • $lotteryName";
+            echo "$sourceLabel for $state &bull; $lotteryName";
           ?>
           [[br]]
           [[em]]<?php echo date('M j, Y g:ia', strtotime($set['created_at'])); ?>[[/em]]
@@ -7505,7 +7543,7 @@ function skaiLiveSnapshotHTML(historyArr){
   html += '[[/div]]';
 
   html += '[[/div]]'; // grid
-html += '<div class="skai-live-cta">Tip: change <strong>one setting</strong> and save a new run - that\'s how the page learns what improves Agreement.</div>';
+  html += '[[div class="skai-live-cta"]]Tip: change [[strong]]one setting[[/strong]] and save a new run - that\'s how the page learns what improves Agreement.[[/div]]';
   html += '[[/div]]';
 
   return html;
