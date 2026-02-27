@@ -1301,6 +1301,105 @@ foreach ($bestOpps as $__bavLid => &$__bavOpp) {
 }
 unset($__bavOpp);
 
+// ------------------------------------------------------------------
+// 7) Build per-lottery prediction-results summary for the comparison table.
+//    Groups ALL saved runs (scored + unscored) across all draw dates.
+//    Uses already-loaded $bestOpps, $groups and $savedSets – no DB queries.
+// ------------------------------------------------------------------
+
+// Quick lookup: run_id -> scored result (from all_scored_runs in $bestOpps)
+$__scoredByRunId = array();
+foreach ($bestOpps as $__lid => $__opp) {
+    foreach ($__opp['all_scored_runs'] as $__sr) {
+        $__scoredByRunId[(int)$__sr['run_id']] = $__sr;
+    }
+}
+
+// Quick lookup: run_id -> display name info (source, mode, label)
+$__runDispInfo = array();
+foreach ($savedSets as $__s) {
+    $__rid = (int)$__s->id;
+    $__src = (string)$__s->source;
+    $__baseLabel = $__methodLabels[$__src] ?? ucwords(str_replace('_', ' ', $__src));
+    $__modeStr = '';
+    if ($__src === 'skai_prediction' && !empty($__s->skai_run_mode)) {
+        $__modeStr = ucwords(str_replace('_', ' ', (string)$__s->skai_run_mode));
+    }
+    $__runDispInfo[$__rid] = array(
+        'base_label' => $__baseLabel,
+        'mode'       => $__modeStr,
+        'label'      => !empty($__s->label) ? (string)$__s->label : '',
+        'source'     => $__src,
+    );
+}
+
+// Group all runs per lottery_id
+$__runSummary = array();
+foreach ($groups as $__gKey => $__g) {
+    $__lid = (int)$__g['lottery_id'];
+    if (!isset($__runSummary[$__lid])) {
+        $__runSummary[$__lid] = array(
+            'lottery_name' => (string)($__g['lottery_name'] ?? ''),
+            'state_name'   => (string)($lottoMetaById[$__lid]['state'] ?? ''),
+            'runs'         => array(),
+            'max_hits'     => 0,
+            'best_run_id'  => 0,
+        );
+    }
+    foreach ($__g['preds'] as $__pred) {
+        $__rid = (int)$__pred->id;
+        $__scored = isset($__scoredByRunId[$__rid]) ? $__scoredByRunId[$__rid] : null;
+        $__mainHits  = ($__scored !== null) ? (int)$__scored['hits']       : null;
+        $__extraHits = ($__scored !== null) ? (int)$__scored['extra_hits'] : null;
+        $__actualMain = ($__scored !== null) ? $__scored['actual_main']    : array();
+        // Predicted main numbers
+        $__predNums = array_values(array_filter(
+            array_map('intval', explode(',', (string)($__pred->main_numbers ?? ''))),
+            function ($n) { return $n !== 0; }
+        ));
+        // Predicted extra ball
+        $__predExtra = 0;
+        if (!empty($__pred->extra_ball_numbers)) {
+            $__etmp = array_values(array_filter(array_map('intval', explode(',', (string)$__pred->extra_ball_numbers))));
+            if (!empty($__etmp)) { $__predExtra = (int)$__etmp[0]; }
+        }
+        $__totalHits = (int)($__mainHits ?? 0) + (int)($__extraHits ?? 0);
+        if ($__totalHits > $__runSummary[$__lid]['max_hits']) {
+            $__runSummary[$__lid]['max_hits']    = $__totalHits;
+            $__runSummary[$__lid]['best_run_id'] = $__rid;
+        }
+        $__runSummary[$__lid]['runs'][] = array(
+            'run_id'       => $__rid,
+            'draw_date'    => (string)($__g['draw_date'] ?? ''),
+            'source'       => (string)$__pred->source,
+            'pred_main'    => $__predNums,
+            'pred_extra'   => $__predExtra,
+            'actual_main'  => $__actualMain,
+            'hits_main'    => $__mainHits,
+            'hits_extra'   => $__extraHits,
+            'has_draw'     => ($__scored !== null),
+            'disp'         => isset($__runDispInfo[$__rid]) ? $__runDispInfo[$__rid] : array('base_label'=>'','mode'=>'','label'=>'','source'=>$__pred->source),
+        );
+    }
+}
+
+// Sort each lottery's runs: by total hits descending (scored first), then by draw_date desc
+foreach ($__runSummary as $__lid => &$__lsRef) {
+    usort($__lsRef['runs'], function ($a, $b) {
+        // Scored runs before unscored
+        if ($a['has_draw'] !== $b['has_draw']) {
+            return $a['has_draw'] ? -1 : 1;
+        }
+        if ($a['has_draw']) {
+            $aT = (int)$a['hits_main'] + (int)$a['hits_extra'];
+            $bT = (int)$b['hits_main'] + (int)$b['hits_extra'];
+            if ($aT !== $bT) { return $bT - $aT; }
+        }
+        return strcmp((string)$b['draw_date'], (string)$a['draw_date']);
+    });
+}
+unset($__lsRef);
+
 // 5) Analysis types used to render per-method prediction columns.
 $modules = array(
     array('key' => 'skip_hit',        'label' => 'Pattern Analysis',      'icon' => '', 'tooltip' => 'Analyzes historical draw patterns'),
@@ -2284,6 +2383,382 @@ foreach ($bestOpps as $__sopp) {
   <?php endforeach; ?>
   [[/div]]
 [[/div]]
+
+<!-- ============================================================
+     PREDICTION RESULTS COMPARISON TABLE
+     Line-by-line summary per lottery, across all dates.
+     Shows every prediction run with hits highlighted.
+     ============================================================ -->
+[[style]]
+/* ── Prediction Results Comparison ─────────────────────────── */
+.prc-wrap {
+  margin: 0 0 14px 0;
+}
+.prc-section {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  overflow: hidden;
+  margin-bottom: 10px;
+  box-shadow: 0 2px 8px rgba(15,23,42,0.05);
+}
+.prc-header {
+  display: -webkit-flex;
+  display: flex;
+  -webkit-align-items: center;
+  align-items: center;
+  -webkit-justify-content: space-between;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: linear-gradient(135deg, #0A1A33 0%, #162d52 100%);
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+  gap: 10px;
+  -webkit-flex-wrap: wrap;
+  flex-wrap: wrap;
+}
+.prc-header-left {
+  display: -webkit-flex;
+  display: flex;
+  -webkit-align-items: center;
+  align-items: center;
+  gap: 8px;
+  -webkit-flex-wrap: wrap;
+  flex-wrap: wrap;
+}
+.prc-title {
+  font-size: 0.9rem;
+  font-weight: 800;
+  color: #ffffff;
+  margin: 0;
+  line-height: 1.2;
+}
+.prc-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.25);
+  background: rgba(255,255,255,0.12);
+  color: #ffffff;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.prc-badge-best {
+  background: rgba(250,204,21,0.85);
+  border-color: rgba(234,179,8,0.9);
+  color: #1c1400;
+}
+.prc-toggle-btn {
+  font-size: 0.72rem;
+  color: rgba(255,255,255,0.75);
+  background: rgba(255,255,255,0.10);
+  border: 1px solid rgba(255,255,255,0.22);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-flex-shrink: 0;
+  flex-shrink: 0;
+}
+.prc-body {
+  overflow-x: auto;
+}
+.prc-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.82rem;
+  min-width: 580px;
+}
+.prc-table thead th {
+  background: #f1f5f9;
+  color: #1e293b;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 7px 9px;
+  border-bottom: 2px solid #e2e8f0;
+  text-align: left;
+  white-space: nowrap;
+  position: -webkit-sticky;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.prc-table tbody tr {
+  border-bottom: 1px solid #f1f5f9;
+  -webkit-transition: background 0.12s;
+  transition: background 0.12s;
+}
+.prc-table tbody tr:last-child {
+  border-bottom: none;
+}
+.prc-table tbody tr:hover {
+  background: #f8fafc;
+}
+.prc-table tbody td {
+  padding: 6px 9px;
+  vertical-align: middle;
+  color: #334155;
+}
+/* Row states */
+.prc-row-best {
+  background: #fefce8 !important;
+  border-left: 3px solid #facc15 !important;
+}
+.prc-row-best td:first-child { padding-left: 6px; }
+.prc-row-hit2 {
+  background: #f0fdf4 !important;
+}
+.prc-row-pending {
+  background: #fafafa;
+  color: #94a3b8;
+}
+/* Hit/miss number pills in comparison table */
+.prc-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  border: 1px solid #dde3ef;
+  background: #f5f7ff;
+  color: #334155;
+  margin: 1px;
+}
+.prc-num-hit {
+  background: #16a34a;
+  border-color: #15803d;
+  color: #ffffff;
+}
+.prc-num-extra {
+  background: #7c3aed;
+  border-color: #6d28d9;
+  color: #ffffff;
+}
+.prc-num-extra-miss {
+  background: #ede9fe;
+  border-color: #ddd6fe;
+  color: #5b21b6;
+}
+/* Source method badge in table */
+.prc-src {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.prc-src-skip    { background:#e0f2fe; color:#0369a1; border:1px solid #bae6fd; }
+.prc-src-ai      { background:#dcfce7; color:#166534; border:1px solid #bbf7d0; }
+.prc-src-mcmc    { background:#ede9fe; color:#5b21b6; border:1px solid #ddd6fe; }
+.prc-src-skai    { background:#ecfeff; color:#0e7490; border:1px solid #a5f3fc; }
+.prc-src-heatmap { background:#fef3c7; color:#92400e; border:1px solid #fde68a; }
+/* Hit count cells */
+.prc-hits-cell {
+  font-size: 0.88rem;
+  font-weight: 800;
+  color: #1e293b;
+  white-space: nowrap;
+}
+.prc-hits-cell .prc-main { color: #16a34a; }
+.prc-hits-cell .prc-extra { color: #7c3aed; }
+.prc-hits-zero { color: #94a3b8; font-weight: 400; }
+/* Pending "Upcoming" label */
+.prc-pending-lbl {
+  font-size: 0.75rem;
+  color: #94a3b8;
+  font-style: italic;
+}
+/* Trophy icon for best row */
+.prc-trophy { margin-right: 2px; }
+/* Section heading for "Upcoming draws" within table */
+.prc-section-subhead {
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 5px 9px;
+  border-top: 1px dashed #e2e8f0;
+  border-bottom: 1px solid #e2e8f0;
+}
+@media (max-width:640px){
+  .prc-table { min-width: 420px; }
+  .prc-table thead th, .prc-table tbody td { padding: 5px 6px; }
+  .prc-num { min-width:1.4rem; height:1.4rem; font-size:0.72rem; }
+}
+[[/style]]
+
+<?php if (!empty($__runSummary)): ?>
+[[div class="prc-wrap" aria-label="Prediction results comparison" role="region"]]
+
+  [[div style="display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;gap:8px;margin-bottom:8px;"]]
+    [[h2 style="font-size:1rem;font-weight:800;color:#1e293b;margin:0;"]]Prediction Results — Line-by-Line[[/h2]]
+    [[span style="font-size:0.78rem;color:#64748b;"]]All runs, all dates. Best hits highlighted.[[/span]]
+  [[/div]]
+
+  <?php foreach ($__runSummary as $__prcLid => $__prcData):
+      $__prcRuns      = $__prcData['runs'] ?? array();
+      if (empty($__prcRuns)) { continue; }
+      $__prcLotName   = htmlspecialchars((string)$__prcData['lottery_name'], ENT_QUOTES, 'UTF-8');
+      $__prcState     = htmlspecialchars((string)$__prcData['state_name'],   ENT_QUOTES, 'UTF-8');
+      $__prcMaxHits   = (int)$__prcData['max_hits'];
+      $__prcBestRunId = (int)$__prcData['best_run_id'];
+      $__prcTotal     = count($__prcRuns);
+      $__prcScored    = 0;
+      foreach ($__prcRuns as $__pr) { if ($__pr['has_draw']) { $__prcScored++; } }
+      $__prcSectionId = 'prc-sec-' . (int)$__prcLid;
+  ?>
+  [[div class="prc-section" id="<?php echo $__prcSectionId; ?>"]]
+    [[div class="prc-header" onclick="skaiPrcToggle('<?php echo $__prcSectionId; ?>')" role="button" tabindex="0"
+          aria-expanded="true" aria-controls="<?php echo $__prcSectionId; ?>-body"
+          onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();skaiPrcToggle('<?php echo $__prcSectionId; ?>')}]]
+
+      [[div class="prc-header-left"]]
+        [[h3 class="prc-title"]]<?php echo $__prcLotName; ?><?php echo $__prcState ? ' &ndash; ' . $__prcState : ''; ?>[[/h3]]
+        [[span class="prc-badge"]]<?php echo $__prcTotal; ?> run<?php echo $__prcTotal !== 1 ? 's' : ''; ?>[[/span]]
+        [[span class="prc-badge"]]<?php echo $__prcScored; ?> scored[[/span]]
+        <?php if ($__prcMaxHits > 0): ?>
+          [[span class="prc-badge prc-badge-best"]]&#x1F3C6; Best: <?php echo $__prcMaxHits; ?> hits[[/span]]
+        <?php endif; ?>
+      [[/div]]
+      [[button type="button" class="prc-toggle-btn" data-prc-id="<?php echo $__prcSectionId; ?>"]]&#x25BC; Collapse[[/button]]
+    [[/div]]
+
+    [[div class="prc-body" id="<?php echo $__prcSectionId; ?>-body"]]
+      [[table class="prc-table"]]
+        [[thead]]
+          [[tr]]
+            [[th]]#[[/th]]
+            [[th]]Draw Date[[/th]]
+            [[th]]Method[[/th]]
+            [[th]]Mode / Label[[/th]]
+            [[th]]Your Numbers[[/th]]
+            [[th]]Actual Numbers[[/th]]
+            [[th]]Main Hits[[/th]]
+            [[th]]Extra[[/th]]
+            [[th]]Total[[/th]]
+          [[/tr]]
+        [[/thead]]
+        [[tbody]]
+          <?php
+          $__prcRowNum   = 0;
+          $__prevHasDraw = true;
+          foreach ($__prcRuns as $__pr):
+              $__prcRowNum++;
+              $__prSrc        = (string)$__pr['source'];
+              $__prHasD       = (bool)$__pr['has_draw'];
+              $__prMainHits   = ($__prHasD && $__pr['hits_main'] !== null)  ? (int)$__pr['hits_main']  : null;
+              $__prExtraHits  = ($__prHasD && $__pr['hits_extra'] !== null) ? (int)$__pr['hits_extra'] : null;
+              $__prTotal      = (int)($__prMainHits ?? 0) + (int)($__prExtraHits ?? 0);
+              $__prIsBest     = ($__prHasD && (int)$__pr['run_id'] === $__prcBestRunId && $__prcMaxHits > 0);
+              $__prIs2Plus    = ($__prHasD && (int)($__prMainHits ?? 0) >= 2 && !$__prIsBest);
+              $__prRowClass   = $__prIsBest ? 'prc-row-best' : ($__prIs2Plus ? 'prc-row-hit2' : ($__prHasD ? '' : 'prc-row-pending'));
+
+              // Insert separator row before upcoming section
+              if ($__prevHasDraw && !$__prHasD):
+          ?>
+          [[tr]][[td colspan="9" class="prc-section-subhead"]]Upcoming Draws (not yet scored)[[/td]][[/tr]]
+          <?php
+              endif;
+              $__prevHasDraw = $__prHasD;
+
+              // Draw date display
+              $__prDateTs  = strtotime((string)$__pr['draw_date']);
+              $__prDateStr = $__prDateTs ? date('M j, Y', $__prDateTs) : htmlspecialchars((string)$__pr['draw_date'], ENT_QUOTES, 'UTF-8');
+
+              // Method badge class
+              $__prSrcClass = 'prc-src-skip';
+              if ($__prSrc === 'ai_prediction')   { $__prSrcClass = 'prc-src-ai'; }
+              elseif ($__prSrc === 'mcmc_prediction') { $__prSrcClass = 'prc-src-mcmc'; }
+              elseif ($__prSrc === 'skai_prediction') { $__prSrcClass = 'prc-src-skai'; }
+              elseif ($__prSrc === 'heatmap')         { $__prSrcClass = 'prc-src-heatmap'; }
+
+              $__prDispInfo   = $__pr['disp'];
+              $__prBaseLabel  = htmlspecialchars((string)$__prDispInfo['base_label'], ENT_QUOTES, 'UTF-8');
+              $__prMode       = htmlspecialchars((string)$__prDispInfo['mode'],  ENT_QUOTES, 'UTF-8');
+              $__prLabel      = htmlspecialchars((string)$__prDispInfo['label'], ENT_QUOTES, 'UTF-8');
+              $__prModeLabel  = $__prMode !== '' ? $__prMode : ($__prLabel !== '' ? $__prLabel : '—');
+          ?>
+          [[tr class="<?php echo $__prRowClass; ?>"]]
+            [[td style="color:#94a3b8;font-size:0.75rem;"]]
+              <?php if ($__prIsBest): ?>[[span class="prc-trophy"]]&#x1F3C6;[[/span]]<?php endif; ?>
+              <?php echo $__prcRowNum; ?>
+            [[/td]]
+            [[td style="white-space:nowrap;"]]<?php echo $__prDateStr; ?>[[/td]]
+            [[td]][[span class="prc-src <?php echo $__prSrcClass; ?>"]]<?php echo $__prBaseLabel; ?>[[/span]][[/td]]
+            [[td style="color:#475569;font-size:0.8rem;"]]<?php echo $__prModeLabel; ?>[[/td]]
+            [[td]]
+              <?php
+                // Use array_flip for O(1) lookup instead of O(m) in_array per number
+                $__actualLookup = $__prHasD ? array_flip((array)$__pr['actual_main']) : array();
+                foreach ($__pr['pred_main'] as $__pn):
+                  $__pnHit = $__prHasD && isset($__actualLookup[$__pn]);
+              ?>[[span class="prc-num <?php echo $__pnHit ? 'prc-num-hit' : ''; ?>"]]<?php echo (int)$__pn; ?>[[/span]]<?php endforeach; ?>
+            [[/td]]
+            [[td]]
+              <?php if ($__prHasD && !empty($__pr['actual_main'])): ?>
+                <?php foreach ($__pr['actual_main'] as $__an): ?>
+                  [[span class="prc-num"]]<?php echo (int)$__an; ?>[[/span]]
+                <?php endforeach; ?>
+              <?php elseif (!$__prHasD): ?>
+                [[span class="prc-pending-lbl"]]Upcoming[[/span]]
+              <?php else: ?>
+                [[span class="prc-pending-lbl"]]N/A[[/span]]
+              <?php endif; ?>
+            [[/td]]
+            [[td class="prc-hits-cell"]]
+              <?php if ($__prHasD): ?>
+                <?php if ($__prMainHits > 0): ?>
+                  [[span class="prc-main"]]<?php echo $__prMainHits; ?>[[/span]]
+                <?php else: ?>
+                  [[span class="prc-hits-zero"]]0[[/span]]
+                <?php endif; ?>
+              <?php else: ?>
+                [[span class="prc-pending-lbl"]]—[[/span]]
+              <?php endif; ?>
+            [[/td]]
+            [[td class="prc-hits-cell"]]
+              <?php if ($__prHasD): ?>
+                <?php if ((int)($__prExtraHits ?? 0) > 0): ?>
+                  [[span class="prc-extra"]]&#x2713;[[/span]]
+                <?php else: ?>
+                  [[span class="prc-hits-zero"]]—[[/span]]
+                <?php endif; ?>
+              <?php else: ?>
+                [[span class="prc-pending-lbl"]]—[[/span]]
+              <?php endif; ?>
+            [[/td]]
+            [[td class="prc-hits-cell"]]
+              <?php if ($__prHasD): ?>
+                <?php if ($__prTotal > 0): ?>
+                  [[strong]]<?php echo $__prTotal; ?>[[/strong]]
+                <?php else: ?>
+                  [[span class="prc-hits-zero"]]0[[/span]]
+                <?php endif; ?>
+              <?php else: ?>
+                [[span class="prc-pending-lbl"]]—[[/span]]
+              <?php endif; ?>
+            [[/td]]
+          [[/tr]]
+          <?php endforeach; ?>
+        [[/tbody]]
+      [[/table]]
+    [[/div]]
+  [[/div]]
+  <?php endforeach; ?>
+
+[[/div]]
+<?php endif; ?>
 
 <?php if (empty($groups)): ?>
   [[div class="skai-card prediction-placeholder" style="margin-bottom:2rem; text-align:center; padding:2rem;"]]
@@ -6881,6 +7356,34 @@ initLotteryCollapse();
     }
   });
 })();
+[[/script]]
+
+[[script]]
+// ============================================================
+// skaiPrcToggle: Collapse / expand a prediction-results table section.
+// ES5-compatible; no dependencies.
+// ============================================================
+function skaiPrcToggle(sectionId) {
+  var sec  = document.getElementById(sectionId);
+  if (!sec) { return; }
+  var body = document.getElementById(sectionId + '-body');
+  var hdr  = sec.querySelector('.prc-header');
+  var btn  = sec.querySelector('.prc-toggle-btn');
+
+  if (!body) { return; }
+
+  var isOpen = body.style.display !== 'none';
+
+  if (isOpen) {
+    body.style.display = 'none';
+    if (btn) { btn.textContent = '\u25BA Expand'; }
+    if (hdr) { hdr.setAttribute('aria-expanded', 'false'); }
+  } else {
+    body.style.display = '';
+    if (btn) { btn.textContent = '\u25BC Collapse'; }
+    if (hdr) { hdr.setAttribute('aria-expanded', 'true'); }
+  }
+}
 [[/script]]
 
 {/source}
