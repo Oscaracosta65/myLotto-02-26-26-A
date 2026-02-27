@@ -1431,31 +1431,78 @@ foreach ($groups as $__gKey => $__g) {
             if (!empty($__predExtraVals)) { $__predExtra = (int)$__predExtraVals[0]; }
         }
 
-        // ── Fallback: when the UNION-ALL/drawMap path did not score this run
-        //    (common for regular lotteries without an extra ball, or when the
-        //    UNION ALL query failed), call getDrawByDate() directly – same
-        //    approach used by the per-prediction-card rendering code. ──────
+        // ── Fallback: when $__scoredByRunId did not have a scored entry for this run,
+        //    resolve the draw using the same two-phase approach as the per-card section:
+        //    Phase 1 – read from preloaded $drawMap (normalized main_0…, extra_ball columns)
+        //    Phase 2 – if $drawMap has no entry, call getDrawByDate() + raw column names
         if ($__scored === null) {
-            // Populate the cache entry for this game_id+date once.
+            // Populate the cache entry for this game_id+date once per group.
             if (!array_key_exists($__fbCacheKey, $__drawFallbackCache)) {
-                $__fbRow    = getDrawByDate((int)$__g['game_id'], $__gDateNorm, $db);
-                $__fbFields = $__fbRow ? getDrawFields((int)$__g['game_id']) : array('main' => array(), 'extra' => null);
-                $__fbMain   = array();
-                $__fbExtra  = array();
-                if ($__fbRow) {
-                    foreach (($__fbFields['main'] ?? array()) as $__fbc) {
-                        if (isset($__fbRow[$__fbc]) && $__fbRow[$__fbc] !== '') {
-                            $__fbMain[] = (int)$__fbRow[$__fbc];
+                $__fbMain  = array();
+                $__fbExtra = array();
+
+                // Phase 1: check $drawMap (same key format as scoreRunFromDrawMap)
+                if (!empty($drawMap) && isset($drawMap[$__fbCacheKey])) {
+                    $__fbDmRow = $drawMap[$__fbCacheKey];
+                    $__fbHasNorm = array_key_exists('main_0', $__fbDmRow);
+                    if ($__fbHasNorm) {
+                        for ($__fbi = 0; $__fbi < 25; $__fbi++) {
+                            $__fbk = 'main_' . $__fbi;
+                            if (isset($__fbDmRow[$__fbk]) && $__fbDmRow[$__fbk] !== '' && $__fbDmRow[$__fbk] !== null) {
+                                $__fbv = (int)$__fbDmRow[$__fbk];
+                                if ($__fbv) { $__fbMain[] = $__fbv; }
+                            }
+                        }
+                        if (isset($__fbDmRow['extra_ball']) && $__fbDmRow['extra_ball'] !== '' && $__fbDmRow['extra_ball'] !== null) {
+                            $__fbev = (int)$__fbDmRow['extra_ball'];
+                            if ($__fbev) { $__fbExtra[] = $__fbev; }
+                        }
+                    } else {
+                        // drawMap row has raw column names (unusual)
+                        $__fbFields = getDrawFields((int)$__g['game_id']);
+                        foreach (($__fbFields['main'] ?? array()) as $__fbc) {
+                            if (isset($__fbDmRow[$__fbc]) && $__fbDmRow[$__fbc] !== '') { $__fbMain[] = (int)$__fbDmRow[$__fbc]; }
+                        }
+                        if (!empty($__fbFields['extra']) && isset($__fbDmRow[$__fbFields['extra']]) && $__fbDmRow[$__fbFields['extra']] !== '') {
+                            $__fbExtra[] = (int)$__fbDmRow[$__fbFields['extra']];
                         }
                     }
-                    if (!empty($__fbFields['extra']) && isset($__fbRow[$__fbFields['extra']]) && $__fbRow[$__fbFields['extra']] !== '') {
-                        $__fbExtra[] = (int)$__fbRow[$__fbFields['extra']];
+                }
+
+                // Phase 2: $drawMap miss or produced empty mains – fall back to DB
+                if (empty($__fbMain)) {
+                    $__fbRow    = getDrawByDate((int)$__g['game_id'], $__gDateNorm, $db);
+                    $__fbFields = $__fbRow ? getDrawFields((int)$__g['game_id']) : array('main' => array(), 'extra' => null);
+                    if ($__fbRow) {
+                        if (array_key_exists('main_0', $__fbRow)) {
+                            // Row has normalized columns (from drawMap)
+                            for ($__fbi = 0; $__fbi < 25; $__fbi++) {
+                                $__fbk = 'main_' . $__fbi;
+                                if (isset($__fbRow[$__fbk]) && $__fbRow[$__fbk] !== '' && $__fbRow[$__fbk] !== null) {
+                                    $__fbv = (int)$__fbRow[$__fbk];
+                                    if ($__fbv) { $__fbMain[] = $__fbv; }
+                                }
+                            }
+                            if (isset($__fbRow['extra_ball']) && $__fbRow['extra_ball'] !== '' && $__fbRow['extra_ball'] !== null) {
+                                $__fbev = (int)$__fbRow['extra_ball'];
+                                if ($__fbev) { $__fbExtra[] = $__fbev; }
+                            }
+                        } else {
+                            // Raw row: use original column names from config
+                            foreach (($__fbFields['main'] ?? array()) as $__fbc) {
+                                if (isset($__fbRow[$__fbc]) && $__fbRow[$__fbc] !== '') { $__fbMain[] = (int)$__fbRow[$__fbc]; }
+                            }
+                            if (!empty($__fbFields['extra']) && isset($__fbRow[$__fbFields['extra']]) && $__fbRow[$__fbFields['extra']] !== '') {
+                                $__fbExtra[] = (int)$__fbRow[$__fbFields['extra']];
+                            }
+                        }
                     }
                 }
+
                 $__drawFallbackCache[$__fbCacheKey] = array(
-                    'has_draw'   => ($__fbRow !== null && !empty($__fbMain)),
-                    'drawMain'   => $__fbMain,
-                    'drawExtra'  => $__fbExtra,
+                    'has_draw'  => !empty($__fbMain),
+                    'drawMain'  => $__fbMain,
+                    'drawExtra' => $__fbExtra,
                 );
             }
             $__fb = $__drawFallbackCache[$__fbCacheKey];
