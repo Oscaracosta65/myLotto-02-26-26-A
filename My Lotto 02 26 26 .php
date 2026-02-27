@@ -2689,9 +2689,30 @@ function buildLotteryLogoPath(string $stateName, string $gameName): array
 // Load Data: Saved Predictions
 // --------------------------------------------------
 
+// Probe the actual columns present in #__user_saved_numbers so the SELECT
+// never requests a column that does not yet exist in an older schema.
+$__snTable = $db->replacePrefix('#__user_saved_numbers');
+$__snCols  = array();
+try {
+    $__snColRows = $db->setQuery('SHOW COLUMNS FROM ' . $db->quoteName($__snTable))->loadAssocList('Field') ?: array();
+    $__snCols = array_keys($__snColRows);
+} catch (Exception $e) {
+    $__snCols = array(); // fallback: add nothing optional
+}
+// Helper: return a safe SQL expression for an optional sn-alias column.
+// When the column exists: "sn.`colname`"
+// When absent:            "NULL AS `colname`" (property still available on each row object)
+$__snCol = function ($col) use ($__snCols, $db) {
+    if (in_array($col, $__snCols, true)) {
+        return 'sn.' . $db->quoteName($col);
+    }
+    return 'NULL AS ' . $db->quoteName($col);
+};
+
 // 1) Fetch saved predictions with timestamps
 $q = $db->getQuery(true);
-$q->select(array(
+// Core columns (always present – created with the original table)
+$__snSelect = array(
     'sn.id','sn.lottery_id','sn.next_draw_date','sn.source','sn.label','sn.main_numbers',
     'sn.extra_ball_numbers','sn.date_saved','sn.generated_at',
 
@@ -2709,15 +2730,16 @@ $q->select(array(
     'sn.digit_probabilities',
     'l.game_id','l.name AS lottery_name',
     'sn.pure_mode',
-    'sn.pure_uid',
-    'sn.top_combos_json',
-    'sn.position_combinations',
-    'sn.tuned_window',
-    'sn.extra_number',
-    'sn.extra_numbers',
-    'sn.bonus_number'
-
-));
+);
+// Optional columns added in later schema revisions – safe NULL fallback when absent.
+$__snOptional = array(
+    'pure_uid', 'top_combos_json', 'position_combinations',
+    'tuned_window', 'extra_number', 'extra_numbers', 'bonus_number',
+);
+foreach ($__snOptional as $__optCol) {
+    $__snSelect[] = $__snCol($__optCol);
+}
+$q->select($__snSelect);
 $q->from($db->quoteName('#__user_saved_numbers', 'sn'));
 $q->join('LEFT', $db->quoteName('#__lotteries', 'l') . ' ON sn.lottery_id = l.lottery_id');
 
