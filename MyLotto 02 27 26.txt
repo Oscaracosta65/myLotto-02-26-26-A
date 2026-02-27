@@ -1333,6 +1333,12 @@ foreach ($savedSets as $__s) {
     );
 }
 
+// Draw-fetch fallback cache: keyed by "game_id|Y-m-d".
+// Used when scoreRunFromDrawMap / $bestOpps['all_scored_runs'] did not score a run
+// (e.g. the UNION ALL path failed or was skipped for this lottery table).
+// Mirrors exactly what the per-prediction-card code does at render time.
+$__drawFallbackCache = array();
+
 // Group all runs per lottery_id
 $__runSummary = array();
 foreach ($groups as $__gKey => $__g) {
@@ -1346,23 +1352,78 @@ foreach ($groups as $__gKey => $__g) {
             'best_run_id'  => 0,
         );
     }
+    // Normalise the group draw_date once for the fallback cache key.
+    $__gDateTs   = strtotime((string)($__g['draw_date'] ?? ''));
+    $__gDateNorm = $__gDateTs ? date('Y-m-d', $__gDateTs) : (string)($__g['draw_date'] ?? '');
+    $__fbCacheKey = (int)$__g['game_id'] . '|' . $__gDateNorm;
+
     foreach ($__g['preds'] as $__pred) {
         $__rid = (int)$__pred->id;
         $__scored = isset($__scoredByRunId[$__rid]) ? $__scoredByRunId[$__rid] : null;
-        $__mainHits  = ($__scored !== null) ? (int)$__scored['hits']       : null;
-        $__extraHits = ($__scored !== null) ? (int)$__scored['extra_hits'] : null;
-        $__actualMain = ($__scored !== null) ? $__scored['actual_main']    : array();
-        // Predicted main numbers
+
+        // Parse predicted numbers once; reused in both the fallback and the final entry.
         $__predNums = array_values(array_filter(
             array_map('intval', explode(',', (string)($__pred->main_numbers ?? ''))),
             function ($n) { return $n !== 0; }
         ));
-        // Predicted extra ball
         $__predExtra = 0;
         if (!empty($__pred->extra_ball_numbers)) {
-            $__etmp = array_values(array_filter(array_map('intval', explode(',', (string)$__pred->extra_ball_numbers))));
-            if (!empty($__etmp)) { $__predExtra = (int)$__etmp[0]; }
+            $__predExtraVals = array_values(array_filter(array_map('intval', explode(',', (string)$__pred->extra_ball_numbers))));
+            if (!empty($__predExtraVals)) { $__predExtra = (int)$__predExtraVals[0]; }
         }
+
+        // ── Fallback: when the UNION-ALL/drawMap path did not score this run
+        //    (common for regular lotteries without an extra ball, or when the
+        //    UNION ALL query failed), call getDrawByDate() directly – same
+        //    approach used by the per-prediction-card rendering code. ──────
+        if ($__scored === null) {
+            // Populate the cache entry for this game_id+date once.
+            if (!array_key_exists($__fbCacheKey, $__drawFallbackCache)) {
+                $__fbRow    = getDrawByDate((int)$__g['game_id'], $__gDateNorm, $db);
+                $__fbFields = $__fbRow ? getDrawFields((int)$__g['game_id']) : array('main' => array(), 'extra' => null);
+                $__fbMain   = array();
+                $__fbExtra  = array();
+                if ($__fbRow) {
+                    foreach (($__fbFields['main'] ?? array()) as $__fbc) {
+                        if (isset($__fbRow[$__fbc]) && $__fbRow[$__fbc] !== '') {
+                            $__fbMain[] = (int)$__fbRow[$__fbc];
+                        }
+                    }
+                    if (!empty($__fbFields['extra']) && isset($__fbRow[$__fbFields['extra']]) && $__fbRow[$__fbFields['extra']] !== '') {
+                        $__fbExtra[] = (int)$__fbRow[$__fbFields['extra']];
+                    }
+                }
+                $__drawFallbackCache[$__fbCacheKey] = array(
+                    'has_draw'   => ($__fbRow !== null && !empty($__fbMain)),
+                    'drawMain'   => $__fbMain,
+                    'drawExtra'  => $__fbExtra,
+                );
+            }
+            $__fb = $__drawFallbackCache[$__fbCacheKey];
+
+            if ($__fb['has_draw']) {
+                // Count hits using the already-parsed predicted numbers
+                $__fbMainHits = 0;
+                foreach ($__predNums as $__fn) {
+                    if ($__fn !== 0 && in_array($__fn, $__fb['drawMain'], true)) { $__fbMainHits++; }
+                }
+                $__fbExtraHits = 0;
+                if ($__predExtra > 0 && !empty($__fb['drawExtra']) && in_array($__predExtra, $__fb['drawExtra'], true)) {
+                    $__fbExtraHits = 1;
+                }
+                // Synthesise a scored entry so the rest of the loop behaves identically
+                $__scored = array(
+                    'run_id'      => $__rid,
+                    'hits'        => $__fbMainHits,
+                    'extra_hits'  => $__fbExtraHits,
+                    'actual_main' => $__fb['drawMain'],
+                );
+            }
+        }
+
+        $__mainHits   = ($__scored !== null) ? (int)$__scored['hits']       : null;
+        $__extraHits  = ($__scored !== null) ? (int)$__scored['extra_hits'] : null;
+        $__actualMain = ($__scored !== null) ? $__scored['actual_main']     : array();
         $__totalHits = (int)($__mainHits ?? 0) + (int)($__extraHits ?? 0);
         if ($__totalHits > $__runSummary[$__lid]['max_hits']) {
             $__runSummary[$__lid]['max_hits']    = $__totalHits;
