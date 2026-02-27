@@ -2429,7 +2429,7 @@ function resolvePredictionLines($savedRow, array $lotteryCfg): array
  * @param  array            $lotteryCfg   Entry from lottery_skip_config.json['lotteries'][$gameId]
  * @return array  ['has_draw'=>bool, 'main'=>int[], 'extra'=>int[], 'reason'=>string, 'draw_row'=>array|null]
  */
-function resolveDrawNumbers($db, $gameId, $drawDate, array $lotteryCfg): array
+function resolveDrawNumbers($db, $gameId, $drawDate, array $lotteryCfg, array $drawMap = []): array
 {
     static $__rdnCache = [];
 
@@ -2464,20 +2464,56 @@ function resolveDrawNumbers($db, $gameId, $drawDate, array $lotteryCfg): array
         return $__rdnCache[$cacheKey];
     }
 
-    // --- Fetch draw row (getDrawByDate uses config internally; handles fallback queries) ---
-    $drawRow = getDrawByDate($gameId, $normDate, $db);
+    // --- Layer 1: preloaded drawMap (normalized main_0/main_1/extra_ball keys from UNION query) ---
+    // This path is the most reliable because the UNION was built using the same config table+columns.
+    $drawRow = null;
+    if (!empty($drawMap) && isset($drawMap[$cacheKey])) {
+        $candidate = $drawMap[$cacheKey];
+        for ($__i = 0; $__i < 25; $__i++) {
+            $__mk = 'main_' . $__i;
+            if (array_key_exists($__mk, $candidate) && $candidate[$__mk] !== null && $candidate[$__mk] !== '') {
+                $drawRow = $candidate;
+                break;
+            }
+        }
+    }
+
+    // --- Layer 2: direct DB query via getDrawByDate (raw column names from SELECT *) ---
+    if ($drawRow === null) {
+        try {
+            $drawRow = getDrawByDate($gameId, $normDate, $db);
+        } catch (\Exception $e) {
+            $drawRow = null;
+        }
+    }
+
     if (!$drawRow) {
         $__rdnCache[$cacheKey] = $notFound;
         return $notFound;
     }
 
-    // --- Extract main numbers using ONLY configured column names ---
-    $main = [];
-    foreach ($mainCols as $col) {
-        if (isset($drawRow[$col]) && $drawRow[$col] !== '' && $drawRow[$col] !== null) {
-            $v = (int)$drawRow[$col];
-            if ($v > 0) {
-                $main[] = $v;
+    // --- Extract main numbers ---
+    // For drawMap rows use normalized main_0/main_1 keys; for raw DB rows use configured column names.
+    $main    = [];
+    $hasNorm = array_key_exists('main_0', $drawRow);
+
+    if ($hasNorm) {
+        for ($__i = 0; $__i < 25; $__i++) {
+            $__mk = 'main_' . $__i;
+            if (isset($drawRow[$__mk]) && $drawRow[$__mk] !== '' && $drawRow[$__mk] !== null) {
+                $v = (int)$drawRow[$__mk];
+                if ($v > 0) {
+                    $main[] = $v;
+                }
+            }
+        }
+    } else {
+        foreach ($mainCols as $col) {
+            if (isset($drawRow[$col]) && $drawRow[$col] !== '' && $drawRow[$col] !== null) {
+                $v = (int)$drawRow[$col];
+                if ($v > 0) {
+                    $main[] = $v;
+                }
             }
         }
     }
@@ -2487,8 +2523,8 @@ function resolveDrawNumbers($db, $gameId, $drawDate, array $lotteryCfg): array
             'has_draw' => false,
             'main'     => [],
             'extra'    => [],
-            'reason'   => 'draw_parse_error: configured main columns not found or empty in draw row',
-            'draw_row' => $drawRow,
+            'reason'   => 'draw_parse_error: main columns not found or empty in draw row',
+            'draw_row' => null,
         ];
         $__rdnCache[$cacheKey] = $result;
         return $result;
@@ -2496,13 +2532,27 @@ function resolveDrawNumbers($db, $gameId, $drawDate, array $lotteryCfg): array
 
     // --- Extract extra ball ([] for no-extra-ball games) ---
     $extra = [];
-    if ($extraCol !== null
-        && isset($drawRow[$extraCol])
-        && $drawRow[$extraCol] !== ''
-        && $drawRow[$extraCol] !== null) {
-        $v = (int)$drawRow[$extraCol];
-        if ($v > 0) {
-            $extra = [$v];
+    if ($hasNorm) {
+        // drawMap row: extra_ball normalized key
+        if ($extraCol !== null
+            && array_key_exists('extra_ball', $drawRow)
+            && $drawRow['extra_ball'] !== null
+            && $drawRow['extra_ball'] !== '') {
+            $v = (int)$drawRow['extra_ball'];
+            if ($v > 0) {
+                $extra = [$v];
+            }
+        }
+    } else {
+        // raw DB row: use configured extra column name
+        if ($extraCol !== null
+            && isset($drawRow[$extraCol])
+            && $drawRow[$extraCol] !== ''
+            && $drawRow[$extraCol] !== null) {
+            $v = (int)$drawRow[$extraCol];
+            if ($v > 0) {
+                $extra = [$v];
+            }
         }
     }
 
@@ -3035,7 +3085,7 @@ foreach ($groups as $groupKey => $g) {
 
     // -- Rank Strength (Top-Hits Ranking): canonical resolvers for draw and predictions --
     $__rsCfg  = $configData['lotteries'][(int)$g['game_id']] ?? [];
-    $__rsDraw = resolveDrawNumbers($db, (int)$g['game_id'], (string)$g['draw_date'], $__rsCfg);
+    $__rsDraw = resolveDrawNumbers($db, (int)$g['game_id'], (string)$g['draw_date'], $__rsCfg, $drawMap);
 
     foreach ($g['preds'] as $s) {
         if (!$__rsDraw['has_draw']) {
@@ -6499,7 +6549,7 @@ $when  = $ts ? date('c', $ts) : (string) $tsRaw; // ISO8601 for JS local-time co
                   if (!empty($__tmp)) { $__cardPredExtra = (int)$__tmp[0]; }
               }
               $__cardLotCfg = $configData['lotteries'][$g['game_id']] ?? [];
-              $__cardScored = resolveDrawNumbers($db, $g['game_id'], $g['draw_date'], $__cardLotCfg);
+              $__cardScored = resolveDrawNumbers($db, $g['game_id'], $g['draw_date'], $__cardLotCfg, $drawMap);
               // Convenience aliases used by display logic below
               $drawMain  = $__cardScored['main'];
               $drawExtra = $__cardScored['extra'];
