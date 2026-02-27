@@ -72,6 +72,37 @@ function setUserPref($db, $userId, $key, $value) {
     $db->execute();
 }
 
+/**
+ * Derive a concise label from a saved run row for the Best Settings Snapshot.
+ * Shows method name and optional run mode / template name.
+ */
+function buildBestSettingsSummary(array $row, array $methodLabels)
+{
+    $src = isset($row['source']) ? (string)$row['source'] : '';
+
+    $label = isset($methodLabels[$src])
+        ? (string)$methodLabels[$src]
+        : ucwords(str_replace('_', ' ', $src));
+
+    $templateName = '';
+    if (isset($row['template_name']) && $row['template_name'] !== null && $row['template_name'] !== '') {
+        $templateName = (string)$row['template_name'];
+    } elseif (isset($row['settings_template_name']) && $row['settings_template_name'] !== null && $row['settings_template_name'] !== '') {
+        $templateName = (string)$row['settings_template_name'];
+    }
+    if ($templateName !== '') {
+        return $label . ' - ' . $templateName;
+    }
+
+    if ($src === 'skai_prediction') {
+        $mode = isset($row['skai_run_mode']) ? trim((string)$row['skai_run_mode']) : '';
+        $modeLabel = $mode !== '' ? ucwords(str_replace('_', ' ', $mode)) : 'Default';
+        return $label . ' - ' . $modeLabel;
+    }
+
+    return $label;
+}
+
 // ──────────────────────────────────────────────────────────────
 // New Features toggle (persisted in #__user_profiles)
 // Stored as '1' (show) / '0' (hide).
@@ -465,6 +496,7 @@ $sourceLabels = [
     'heatmap'          => 'Frequency Map',
     'skai_prediction'  => 'Hybrid Model',
 ];
+$__methodLabels = $sourceLabels;
 
 // Map source keys → short codes for compact display
 $iconMap = [
@@ -650,6 +682,78 @@ function buildLotteryLogoPath(string $stateName, string $gameName): array
     // None found → return the first (your canonical) for <img src> if you prefer,
     // but we’ll mark exists=false so the badge shows instead.
     return ['path' => $candidates[0], 'exists' => false, 'alt' => $gameName . ' logo'];
+}
+
+/**
+ * scoreRunFromDrawMap: Score a prediction run against a preloaded draw map entry.
+ * Uses $drawMap (built via UNION ALL query) as the single data source -- no extra DB queries.
+ *
+ * @param array  $drawMap    Preloaded draw map keyed by "game_id|Y-m-d"
+ * @param int    $gameId     Lottery game ID
+ * @param string $drawDate   Draw date (any strtotime-parsable string)
+ * @param array  $predMain   Predicted main numbers (ints; zeros are ignored)
+ * @param int    $predExtra  Predicted extra ball (0 = not set)
+ * @return array { has_draw, drawMain, drawExtra, hits_main, hits_extra }
+ */
+function scoreRunFromDrawMap($drawMap, $gameId, $drawDate, array $predMain, $predExtra = 0)
+{
+    $empty = array('has_draw' => false, 'drawMain' => array(), 'drawExtra' => array(), 'hits_main' => 0, 'hits_extra' => 0);
+    $ts = strtotime((string)$drawDate);
+    if ($ts === false) {
+        return $empty;
+    }
+    $normDate = date('Y-m-d', $ts);
+    $mapKey   = (int)$gameId . '|' . $normDate;
+    if (!isset($drawMap[$mapKey])) {
+        return $empty;
+    }
+    $row = $drawMap[$mapKey];
+
+    // Extract main numbers from normalized columns (main_0, main_1, ...)
+    $drawMain = array();
+    for ($i = 0; $i < 25; $i++) {
+        $k = 'main_' . $i;
+        if (isset($row[$k]) && $row[$k] !== '' && $row[$k] !== null) {
+            $v = (int)$row[$k];
+            if ($v) {
+                $drawMain[] = $v;
+            }
+        }
+    }
+    if (empty($drawMain)) {
+        return $empty;
+    }
+
+    // Extract extra ball from normalized column
+    $drawExtra = array();
+    if (isset($row['extra_ball']) && $row['extra_ball'] !== '' && $row['extra_ball'] !== null) {
+        $v = (int)$row['extra_ball'];
+        if ($v) {
+            $drawExtra[] = $v;
+        }
+    }
+
+    // Count main-ball hits
+    $hitsMain = 0;
+    foreach ($predMain as $n) {
+        if ($n !== 0 && in_array($n, $drawMain, true)) {
+            $hitsMain++;
+        }
+    }
+    // Count extra-ball hit
+    $hitsExtra = 0;
+    $predExtra = (int)$predExtra;
+    if ($predExtra > 0 && !empty($drawExtra) && in_array($predExtra, $drawExtra, true)) {
+        $hitsExtra = 1;
+    }
+
+    return array(
+        'has_draw'   => true,
+        'drawMain'   => $drawMain,
+        'drawExtra'  => $drawExtra,
+        'hits_main'  => $hitsMain,
+        'hits_extra' => $hitsExtra,
+    );
 }
 
 // --------------------------------------------------
@@ -980,6 +1084,222 @@ if (!empty($unionSql)) {
         $drawMap = array();
     }
 }
+
+// ------------------------------------------------------------------
+// 6) Compute Best Opportunities per lottery (Agreement / Top-Hits)
+//    Uses the preloaded $drawMap as the single data source -- no extra DB queries.
+//    Results stored in $bestOpps[lottery_id] for the summary panel.
+// ------------------------------------------------------------------
+
+$bestOpps = array();
+
+// Shared rank comparator: hits desc -> extra_hits desc -> rank_score desc -> run_id desc
+$__rankCompare = function (array $a, array $b) {
+    if ($a['hits'] !== $b['hits']) { return $b['hits'] - $a['hits']; }
+    if ($a['extra_hits'] !== $b['extra_hits']) { return $b['extra_hits'] - $a['extra_hits']; }
+    if ($a['rank_score'] !== $b['rank_score']) { return $b['rank_score'] - $a['rank_score']; }
+    return $b['run_id'] - $a['run_id'];
+};
+
+foreach ($groups as $groupKey => $g) {
+    $lid = (int)$g['lottery_id'];
+
+    if (!isset($bestOpps[$lid])) {
+        $bestOpps[$lid] = array(
+            'lottery_name'    => (string)($g['lottery_name'] ?? ''),
+            'lottery_id'      => $lid,
+            'game_id'         => (int)($g['game_id'] ?? 0),
+            'state_name'      => (string)($lottoMetaById[$lid]['state'] ?? ''),
+            'total_runs'      => 0,
+            'best_agreement'  => array('score' => -1, 'draw_date' => '', 'numbers' => array(), 'methods' => array(), 'run_id' => 0, 'source' => ''),
+            'best_rank'       => array('score' => -1, 'draw_date' => '', 'run_id' => 0, 'source' => '', 'hits' => 0, 'extra_hits' => 0, 'numbers' => array(), 'extra_number' => 0),
+            'all_scored_runs' => array(),
+        );
+    }
+    $bestOpps[$lid]['total_runs'] += count($g['preds']);
+
+    // -- Agreement scoring: numbers shared across different methods --
+    $allSourceNumPool = array();
+    foreach ($g['preds'] as $s) {
+        $src  = (string)$s->source;
+        $nums = array_filter(array_map('intval', explode(',', (string)($s->main_numbers ?? ''))));
+        if (!isset($allSourceNumPool[$src])) { $allSourceNumPool[$src] = array(); }
+        foreach ($nums as $n) { $allSourceNumPool[$src][$n] = true; }
+    }
+    foreach ($g['preds'] as $s) {
+        $src    = (string)$s->source;
+        $myNums = array_filter(array_map('intval', explode(',', (string)($s->main_numbers ?? ''))));
+        $otherNums = array();
+        $otherSrcList = array();
+        foreach ($allSourceNumPool as $otherSrc => $numSet) {
+            if ($otherSrc !== $src) {
+                foreach ($numSet as $n => $_unused) { $otherNums[$n] = true; }
+                $otherSrcList[] = $otherSrc;
+            }
+        }
+        $otherSrcList = array_unique($otherSrcList);
+        $agreed = array();
+        foreach ($myNums as $n) {
+            if (isset($otherNums[$n])) { $agreed[] = $n; }
+        }
+        $score = count($agreed);
+        $prev  = $bestOpps[$lid]['best_agreement'];
+        $isBetter = ($score > $prev['score'])
+            || ($score === $prev['score'] && count($otherSrcList) > count($prev['methods']))
+            || ($score === $prev['score'] && count($otherSrcList) === count($prev['methods']) && (int)$s->id > (int)$prev['run_id']);
+        if ($isBetter) {
+            sort($agreed);
+            $bestOpps[$lid]['best_agreement'] = array(
+                'score'     => $score,
+                'draw_date' => (string)$g['draw_date'],
+                'numbers'   => $agreed,
+                'methods'   => $otherSrcList,
+                'run_id'    => (int)$s->id,
+                'source'    => $src,
+            );
+        }
+    }
+
+    // -- Hit scoring: compare each prediction to the actual drawn numbers via $drawMap --
+    foreach ($g['preds'] as $s) {
+        $predMain = array_values(array_filter(
+            array_map('intval', explode(',', (string)($s->main_numbers ?? ''))),
+            function ($n) { return $n !== 0; }
+        ));
+        $predExtra = 0;
+        if (isset($s->extra_ball_numbers) && $s->extra_ball_numbers !== '' && $s->extra_ball_numbers !== null) {
+            $tmp = array_values(array_filter(array_map('intval', explode(',', (string)$s->extra_ball_numbers))));
+            if (!empty($tmp)) { $predExtra = (int)$tmp[0]; }
+        }
+
+        $__scored = scoreRunFromDrawMap($drawMap, (int)$g['game_id'], (string)$g['draw_date'], $predMain, $predExtra);
+        if (!$__scored['has_draw']) {
+            continue; // draw not yet available; skip this run
+        }
+
+        $mainHitCount  = (int)$__scored['hits_main'];
+        $extraHitCount = (int)$__scored['hits_extra'];
+        $actualMain    = $__scored['drawMain'];
+
+        // Position sum for tie-breaking
+        $posSum = 0;
+        foreach ($predMain as $pos0 => $n) {
+            if (in_array($n, $actualMain, true)) {
+                $posSum += ($pos0 + 1);
+            }
+        }
+        $rankScore = ($mainHitCount * 10000) - $posSum + ($extraHitCount * 1000);
+
+        $bestOpps[$lid]['all_scored_runs'][] = array(
+            'run_id'       => (int)$s->id,
+            'game_id'      => (int)$g['game_id'],
+            'draw_date'    => (string)$g['draw_date'],
+            'source'       => (string)$s->source,
+            'hits'         => $mainHitCount,
+            'extra_hits'   => $extraHitCount,
+            'rank_score'   => $rankScore,
+            'pred_main'    => $predMain,
+            'pred_extra'   => $predExtra,
+            'actual_main'  => $actualMain,
+            'has_draw'     => true,
+        );
+    }
+}
+
+// Post-process: sort scored runs and promote #1 to best_rank
+foreach ($bestOpps as $lid => &$oppRef) {
+    if (!empty($oppRef['all_scored_runs'])) {
+        usort($oppRef['all_scored_runs'], $__rankCompare);
+        $oppWinner = $oppRef['all_scored_runs'][0];
+        if (!empty($oppWinner['has_draw'])) {
+            $oppRef['best_rank'] = array(
+                'score'        => (int)$oppWinner['rank_score'],
+                'draw_date'    => (string)$oppWinner['draw_date'],
+                'run_id'       => (int)$oppWinner['run_id'],
+                'source'       => (string)$oppWinner['source'],
+                'hits'         => (int)$oppWinner['hits'],
+                'extra_hits'   => (int)$oppWinner['extra_hits'],
+                'numbers'      => (array)$oppWinner['pred_main'],
+                'extra_number' => (int)$oppWinner['pred_extra'],
+                'has_draw'     => true,
+            );
+        }
+    }
+}
+unset($oppRef);
+
+// Collect winner run IDs for display-name lookup (single query, not per-run)
+$__winnerRunIds = array();
+foreach ($bestOpps as $__lid => $__opp) {
+    $__rid = (int)($__opp['best_rank']['run_id'] ?? 0);
+    if ($__rid > 0) { $__winnerRunIds[] = $__rid; }
+}
+$__winnerRows = array();
+if (!empty($__winnerRunIds)) {
+    $__wq = $db->getQuery(true)
+        ->select('*')
+        ->from($db->quoteName('#__user_saved_numbers'))
+        ->where($db->quoteName('id')      . ' IN (' . implode(',', array_map('intval', $__winnerRunIds)) . ')')
+        ->where($db->quoteName('user_id') . ' = ' . (int)$user->id);
+    $db->setQuery($__wq);
+    foreach (($db->loadAssocList() ?: array()) as $__wr) {
+        $__winnerRows[(int)$__wr['id']] = $__wr;
+    }
+}
+
+// Compute best-average-hits per lottery (for snapshot cards)
+foreach ($bestOpps as $__bavLid => &$__bavOpp) {
+    $__bavRuns = $__bavOpp['all_scored_runs'] ?? array();
+    if (empty($__bavRuns)) {
+        $__bavOpp['best_avg_hits'] = array('run_id' => 0, 'avg_hits' => 0.0, 'scored_runs' => 0, 'last_scored_date' => '', 'display_name' => 'No scored runs yet');
+        continue;
+    }
+    $__bavByRun = array();
+    foreach ($__bavRuns as $__bavR) {
+        $__rid2 = (int)$__bavR['run_id'];
+        if (!isset($__bavByRun[$__rid2])) {
+            $__bavByRun[$__rid2] = array('run_id' => $__rid2, 'source' => (string)$__bavR['source'], 'total' => 0, 'count' => 0, 'lastdate' => '');
+        }
+        $__bavByRun[$__rid2]['total'] += (int)$__bavR['hits'];
+        $__bavByRun[$__rid2]['count']++;
+        $__d = (string)$__bavR['draw_date'];
+        if ($__d !== '' && $__d > $__bavByRun[$__rid2]['lastdate']) {
+            $__bavByRun[$__rid2]['lastdate'] = $__d;
+        }
+    }
+    $__bavBest = null;
+    foreach ($__bavByRun as $__bavEntry) {
+        $__bavAvg = $__bavEntry['count'] > 0 ? ($__bavEntry['total'] / $__bavEntry['count']) : 0;
+        if ($__bavBest === null) {
+            $__bavBest = $__bavEntry;
+            $__bavBest['avg'] = $__bavAvg;
+        } else {
+            $__prevAvg = $__bavBest['avg'];
+            $isBetter2 = ($__bavAvg > $__prevAvg)
+                || ($__bavAvg === $__prevAvg && $__bavEntry['total'] > $__bavBest['total'])
+                || ($__bavAvg === $__prevAvg && $__bavEntry['total'] === $__bavBest['total'] && $__bavEntry['run_id'] > $__bavBest['run_id']);
+            if ($isBetter2) {
+                $__bavBest = $__bavEntry;
+                $__bavBest['avg'] = $__bavAvg;
+            }
+        }
+    }
+    $__bavTotalScored = array_sum(array_column($__bavByRun, 'count'));
+    $__bavSrc   = (string)($__bavBest['source'] ?? '');
+    $__bavLabel = $__methodLabels[$__bavSrc] ?? ucwords(str_replace('_', ' ', $__bavSrc));
+    $__bavWinnerRow = isset($__winnerRows[$__bavBest['run_id']]) ? $__winnerRows[$__bavBest['run_id']] : null;
+    $__bavDisplayName = ($__bavWinnerRow !== null)
+        ? buildBestSettingsSummary((array)$__bavWinnerRow, $__methodLabels)
+        : $__bavLabel;
+    $__bavOpp['best_avg_hits'] = array(
+        'run_id'           => (int)$__bavBest['run_id'],
+        'avg_hits'         => round((float)$__bavBest['avg'], 2),
+        'scored_runs'      => $__bavTotalScored,
+        'last_scored_date' => (string)($__bavBest['lastdate'] ?? ''),
+        'display_name'     => $__bavDisplayName,
+    );
+}
+unset($__bavOpp);
 
 // 5) Analysis types used to render per-method prediction columns.
 $modules = array(
@@ -1723,6 +2043,247 @@ h3.title { font-size: 1.5rem; }
 
 [[/style]]
 
+
+<!-- ============================================================
+     [SKAI-REF-01] Best Settings Snapshot Panel
+     Shows best-hit summary for each lottery.
+     Populated server-side from $bestOpps (no extra DB queries).
+     ============================================================ -->
+[[style]]
+.skai-global-snapshot {
+  background: linear-gradient(135deg, #0A1A33 0%, #162d52 100%);
+  border-radius: 12px;
+  padding: 14px 18px;
+  margin: 0 0 14px 0;
+  box-shadow: 0 4px 14px rgba(10,26,51,0.18);
+  color: #ffffff;
+}
+.skai-bss-header { margin-bottom: 10px; }
+.skai-bss-title {
+  font-size: 1rem;
+  font-weight: 800;
+  color: #ffffff;
+  margin: 0 0 2px 0;
+  line-height: 1.2;
+}
+.skai-bss-subtitle {
+  font-size: 0.75rem;
+  color: rgba(255,255,255,0.60);
+  margin: 0 0 10px 0;
+}
+.skai-snapshot-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px 16px;
+}
+@media (max-width: 640px) {
+  .skai-snapshot-grid { grid-template-columns: repeat(2, 1fr); }
+}
+.skai-snapshot-metric {
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.skai-snapshot-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255,255,255,0.60);
+  margin-bottom: 4px;
+}
+.skai-snapshot-value {
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: #ffffff;
+  line-height: 1.2;
+}
+.skai-best-settings-list {
+  margin-top: 12px;
+  display: -webkit-flex;
+  display: flex;
+  -webkit-flex-wrap: wrap;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.skai-bss-card {
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 12px;
+  padding: 10px 12px;
+  width: 300px;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.skai-bss-card__name {
+  font-size: 0.92rem;
+  font-weight: 800;
+  color: #ffffff;
+  line-height: 1.2;
+  margin-bottom: 2px;
+}
+.skai-bss-card__method {
+  font-size: 0.78rem;
+  color: rgba(255,255,255,0.75);
+  margin-bottom: 6px;
+  line-height: 1.25;
+}
+.skai-bss-card__metrics {
+  display: -webkit-flex;
+  display: flex;
+  -webkit-flex-wrap: wrap;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.skai-bss-card__metric {
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 8px;
+  padding: 6px 8px;
+  min-width: 80px;
+}
+.skai-bss-card__val {
+  display: block;
+  font-size: 0.92rem;
+  font-weight: 800;
+  color: #ffffff;
+}
+.skai-bss-card__lbl {
+  display: block;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(255,255,255,0.60);
+  margin-top: 2px;
+}
+.skai-bss-card__date {
+  font-size: 0.72rem;
+  color: rgba(255,255,255,0.55);
+  margin-top: 6px;
+}
+.skai-bss-card__actions {
+  margin-top: 8px;
+  display: -webkit-flex;
+  display: flex;
+  gap: 6px;
+  -webkit-flex-wrap: wrap;
+  flex-wrap: wrap;
+}
+.skai-bss-view-btn,
+.skai-bss-all-link {
+  font-size: 0.72rem;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.30);
+  background: rgba(255,255,255,0.10);
+  color: #ffffff;
+  cursor: pointer;
+}
+.skai-bss-view-btn:hover,
+.skai-bss-all-link:hover {
+  background: rgba(255,255,255,0.20);
+}
+.skai-bss-card__spark { margin-top: 8px; }
+[[/style]]
+
+<?php
+// ── Best Settings Snapshot (server-side render) ──────────────────────
+$__snapHasData = false;
+foreach ($bestOpps as $__sopp) {
+    $__bav = isset($__sopp['best_avg_hits']) ? $__sopp['best_avg_hits'] : null;
+    if ($__bav && (int)($__bav['scored_runs'] ?? 0) > 0) { $__snapHasData = true; break; }
+}
+
+// Count totals for the summary metrics
+$__snapTotalLotteries  = count($bestOpps);
+$__snapScoredLotteries = 0;
+$__snapTotalScoredRuns = 0;
+foreach ($bestOpps as $__sopp) {
+    $__bav = isset($__sopp['best_avg_hits']) ? $__sopp['best_avg_hits'] : null;
+    if ($__bav && (int)($__bav['scored_runs'] ?? 0) > 0) {
+        $__snapScoredLotteries++;
+        $__snapTotalScoredRuns += (int)$__bav['scored_runs'];
+    }
+}
+?>
+
+[[div id="skai-global-snapshot" class="skai-global-snapshot" aria-label="Best settings snapshot" role="region"]]
+  [[div class="skai-bss-header"]]
+    [[h2 class="skai-bss-title"]]Best Settings Snapshot[[/h2]]
+    [[p class="skai-bss-subtitle"]]Best-performing settings per lottery (Highest Average Hits).[[/p]]
+  [[/div]]
+  [[div class="skai-snapshot-grid"]]
+    [[div class="skai-snapshot-metric"]]
+      [[div class="skai-snapshot-label"]]Active Lotteries[[/div]]
+      [[div class="skai-snapshot-value"]]<?php echo (int)$__snapTotalLotteries; ?>[[/div]]
+    [[/div]]
+    [[div class="skai-snapshot-metric"]]
+      [[div class="skai-snapshot-label"]]With Scored History[[/div]]
+      [[div class="skai-snapshot-value"]]<?php echo (int)$__snapScoredLotteries; ?>[[/div]]
+    [[/div]]
+    [[div class="skai-snapshot-metric"]]
+      [[div class="skai-snapshot-label"]]Total Scored Runs[[/div]]
+      [[div class="skai-snapshot-value"]]<?php echo (int)$__snapTotalScoredRuns; ?>[[/div]]
+    [[/div]]
+  [[/div]]
+
+  [[div class="skai-best-settings-list"]]
+  <?php foreach ($bestOpps as $__sid => $__sopp):
+      $__bav = isset($__sopp['best_avg_hits']) ? $__sopp['best_avg_hits'] : null;
+      if (!$__bav || (int)($__bav['scored_runs'] ?? 0) <= 0) { continue; }
+      $__snapLotName  = htmlspecialchars((string)($__sopp['lottery_name'] ?? ''), ENT_QUOTES, 'UTF-8');
+      $__snapMethod   = htmlspecialchars((string)($__bav['display_name'] ?? ''), ENT_QUOTES, 'UTF-8');
+      $__snapAvgHits  = number_format((float)($__bav['avg_hits'] ?? 0), 2);
+      $__snapScored   = (int)($__bav['scored_runs'] ?? 0);
+      $__snapLastDate = htmlspecialchars((string)($__bav['last_scored_date'] ?? ''), ENT_QUOTES, 'UTF-8');
+      $__snapRunId    = (int)($__bav['run_id'] ?? 0);
+      $__snapBestHits = (int)($__sopp['best_rank']['hits'] ?? 0);
+      $__snapBestExtra = (int)($__sopp['best_rank']['extra_hits'] ?? 0);
+  ?>
+    [[div class="skai-bss-card"]]
+      [[div class="skai-bss-card__name"]]<?php echo $__snapLotName; ?>[[/div]]
+      <?php if ($__snapMethod !== ''): ?>
+        [[div class="skai-bss-card__method"]]<?php echo $__snapMethod; ?>[[/div]]
+      <?php endif; ?>
+      [[div class="skai-bss-card__metrics"]]
+        [[div class="skai-bss-card__metric"]]
+          [[span class="skai-bss-card__val"]]<?php echo $__snapAvgHits; ?>[[/span]]
+          [[span class="skai-bss-card__lbl"]]Avg Hits[[/span]]
+        [[/div]]
+        [[div class="skai-bss-card__metric"]]
+          [[span class="skai-bss-card__val"]]<?php echo $__snapScored; ?>[[/span]]
+          [[span class="skai-bss-card__lbl"]]Scored Runs[[/span]]
+        [[/div]]
+        <?php if ($__snapBestHits > 0): ?>
+        [[div class="skai-bss-card__metric"]]
+          [[span class="skai-bss-card__val"]]<?php echo $__snapBestHits; ?>[[/span]]
+          [[span class="skai-bss-card__lbl"]]Best Main Hits[[/span]]
+        [[/div]]
+        <?php endif; ?>
+        <?php if ($__snapBestExtra > 0): ?>
+        [[div class="skai-bss-card__metric"]]
+          [[span class="skai-bss-card__val"]]<?php echo $__snapBestExtra; ?>[[/span]]
+          [[span class="skai-bss-card__lbl"]]Best Extra Hit[[/span]]
+        [[/div]]
+        <?php endif; ?>
+      [[/div]]
+      <?php if ($__snapLastDate !== ''): ?>
+        [[div class="skai-bss-card__date"]]Last scored: <?php echo $__snapLastDate; ?>[[/div]]
+      <?php endif; ?>
+      [[div class="skai-bss-card__actions"]]
+        <?php if ($__snapRunId > 0): ?>
+          [[button type="button" class="skai-bss-view-btn"
+                   data-jump-run-id="<?php echo $__snapRunId; ?>"
+                   data-jump-lottery-id="<?php echo (int)$__sid; ?>"]]View best[[/button]]
+        <?php endif; ?>
+        [[button type="button" class="skai-bss-all-link"
+                 data-jump-crr-id="<?php echo (int)$__sid; ?>"]]All runs[[/button]]
+      [[/div]]
+    [[/div]]
+  <?php endforeach; ?>
+  [[/div]]
+[[/div]]
 
 <?php if (empty($groups)): ?>
   [[div class="skai-card prediction-placeholder" style="margin-bottom:2rem; text-align:center; padding:2rem;"]]
@@ -6253,6 +6814,73 @@ initLotteryCollapse();
       el.classList.remove('highlighted-scroll');
     }, 2000);
   }
+[[/script]]
+
+[[script]]
+// ============================================================
+// Best Settings Snapshot: jump handlers
+// "View best" scrolls to a prediction card; "All runs" scrolls
+// to the lottery group. ES5-compatible.
+// ============================================================
+(function initSnapshotJumps() {
+  var snap = document.getElementById('skai-global-snapshot');
+  if (!snap) { return; }
+
+  snap.addEventListener('click', function (ev) {
+    var btn = ev.target;
+    if (!btn || btn.tagName !== 'BUTTON') { return; }
+
+    // Helper: smooth scroll with fallback for older browsers
+    function scrollTo(el) {
+      if (!el) { return; }
+      try {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (e) {
+        el.scrollIntoView(true);
+      }
+    }
+
+    // "View best" — jump to the prediction card for this run
+    if (btn.classList.contains('skai-bss-view-btn')) {
+      var runId = btn.getAttribute('data-jump-run-id') || '';
+      var lid   = btn.getAttribute('data-jump-lottery-id') || '';
+      if (runId) {
+        // Look for the card by data-set-id first
+        var card = document.querySelector('[data-set-id="' + runId + '"]');
+        if (card) {
+          scrollTo(card);
+          return;
+        }
+      }
+      // Fallback: scroll to the lottery group
+      if (lid) {
+        var grps = document.querySelectorAll('.lottery-group');
+        for (var i = 0; i < grps.length; i++) {
+          var grpLid = (grps[i].getAttribute('data-lottery-id') || '').split('-')[0];
+          if (grpLid === String(lid)) {
+            scrollTo(grps[i]);
+            return;
+          }
+        }
+      }
+    }
+
+    // "All runs" — jump to the lottery group for this lottery
+    if (btn.classList.contains('skai-bss-all-link')) {
+      var crrId = btn.getAttribute('data-jump-crr-id') || '';
+      if (crrId) {
+        var grps2 = document.querySelectorAll('.lottery-group');
+        for (var j = 0; j < grps2.length; j++) {
+          var grpLid2 = (grps2[j].getAttribute('data-lottery-id') || '').split('-')[0];
+          if (grpLid2 === String(crrId)) {
+            scrollTo(grps2[j]);
+            return;
+          }
+        }
+      }
+    }
+  });
+})();
 [[/script]]
 
 {/source}
