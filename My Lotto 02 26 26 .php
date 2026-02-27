@@ -1339,8 +1339,8 @@ foreach ($bestOpps as $__sid => $__sopp) {
 }
 .skai-lottery-summary__chip b { color: #0A1A33; }
 
-/* Top�Hits hero styling (agency-grade upgrade)
-   We elevate the Most�Hits metric to hero status with clear hierarchy.
+/* Top•Hits hero styling (agency-grade upgrade)
+   We elevate the Most•Hits metric to hero status with clear hierarchy.
    The badge uses the primary accent colour; the number is large and bold;
    supporting lines use muted colours for readability. */
 .skai-opp-hero {
@@ -1349,7 +1349,7 @@ foreach ($bestOpps as $__sid => $__sopp) {
   align-items: flex-start;
   margin-bottom: 0.75rem;
 }
-/* Badge indicating this card shows Top�Hits */
+/* Badge indicating this card shows Top•Hits */
 .skai-opp-hero-badge {
   font-size: 0.65rem;
   letter-spacing: 0.08em;
@@ -2374,17 +2374,21 @@ function resolvePredictionLines($savedRow, array $lotteryCfg): array
         }
     }
 
-    // --- 3. main_numbers fallback (only when count matches expected ball count) ---
+    // --- 3. main_numbers fallback ---
+    // When count > expectedCount (ranked list saved as main_numbers, e.g. heatmap):
+    //   take the first expectedCount numbers as a single scorable line.
+    // When count < expectedCount (sparse/partial prediction): still score what we have.
     $mainRaw  = array_map('intval', explode(',', (string)($savedRow->main_numbers ?? '')));
     $mainNums = $toInts($mainRaw);
 
-    if ($expectedCount > 0 && count($mainNums) !== $expectedCount) {
-        // Count mismatch: this is a pool or ranked list, not a single scorable line.
+    if (empty($mainNums)) {
         return [];
     }
 
-    if (empty($mainNums)) {
-        return [];
+    if ($expectedCount > 0 && count($mainNums) > $expectedCount) {
+        // Silently truncate: heatmap and similar methods save a ranked candidate pool
+        // rather than a single exact combo; take the top-N as the scorable line.
+        $mainNums = array_slice($mainNums, 0, $expectedCount);
     }
 
     $extraNums = [];
@@ -2704,8 +2708,14 @@ $q->select(array(
     'sn.skai_top_n_numbers','sn.skai_top_n_combos',
     'sn.digit_probabilities',
     'l.game_id','l.name AS lottery_name',
-    'sn.pure_mode'
-
+    'sn.pure_mode',
+    'sn.pure_uid',
+    'sn.top_combos_json',
+    'sn.position_combinations',
+    'sn.tuned_window',
+    'sn.extra_number',
+    'sn.extra_numbers',
+    'sn.bonus_number'
 
 ));
 $q->from($db->quoteName('#__user_saved_numbers', 'sn'));
@@ -2884,7 +2894,7 @@ foreach ($groups as $g) {
 
     for ($i = 0; $i < $maxMain; $i++) {
         if (!empty($tableInfo[$tblKeyInt]['main'][$i])) {
-            // Alias each main ball column to a normalized name: main_0, main_1, �
+            // Alias each main ball column to a normalized name: main_0, main_1, main_2, ...
             $cols[] = $db->quoteName($tableInfo[$tblKeyInt]['main'][$i]) . ' AS main_' . $i; // CHANGED: added alias
         } else {
             $cols[] = 'NULL AS main_' . $i;
@@ -4803,7 +4813,7 @@ uksort($__crrPresentSrcs, function ($a, $b) use ($__crrSourceOrder) {
   [[/span]]
 
   <?php if ($state && $state !== 'Lottery'): ?>
-    &nbsp;�&nbsp;
+    &nbsp;•&nbsp;
     [[span class="lottery-name"]]
       <?php echo htmlspecialchars($state, ENT_QUOTES); ?>
     [[/span]]
@@ -4822,13 +4832,13 @@ uksort($__crrPresentSrcs, function ($a, $b) use ($__crrSourceOrder) {
 ?>
 
 <?php if (!empty($lotName)): ?>
-  &nbsp;�&nbsp;
+  &nbsp;•&nbsp;
   [[span class="lottery-name"]]
     <?php echo htmlspecialchars($lotName, ENT_QUOTES); ?>
   [[/span]]
 <?php endif; ?>
 
-  &nbsp;�&nbsp;
+  &nbsp;•&nbsp;
   <?php
     $ts = strtotime((string) ($g['draw_date'] ?? ''));
     echo $ts ? date('M j, Y', $ts) : htmlspecialchars((string) ($g['draw_date'] ?? ''), ENT_QUOTES);
@@ -4940,7 +4950,7 @@ if ($__drawRow) {
 
 $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
 
-  // If row came from $drawMap, normalized fields exist (main_0, main_1, �, extra_ball)
+  // If row came from $drawMap, normalized fields exist (main_0, main_1, ..., extra_ball)
   $hasNormalizedMains = array_key_exists('main_0', $__drawRow);
 
   if ($hasNormalizedMains) {
@@ -5001,7 +5011,7 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
 
         // Helper: map number -> position (1-based) for a prediction string
         $toPositions = function (string $csv, int $limit) {
-          $arr = array_values(array_filter(array_map('trim', explode(',', $csv)), fn($v)=>$v!==''));
+          $arr = array_values(array_filter(array_map('trim', explode(',', $csv)), function($v) { return $v !== ''; }));
           $pos = [];
           foreach ($arr as $i => $n) {
             if ($i >= $limit) break;
@@ -6159,10 +6169,10 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
     [[br]][[br]]
     [[strong]]How to read it:[[/strong]]
     [[br]]
-    � The [[strong]]red side on the left (low rank numbers)[[/strong]] shows early picks.  
-    � The [[strong]]blue side on the right (high rank numbers)[[/strong]] shows later picks.  
-    � Darker cells mean [[em]]more hits[[/em]] at that rank.  
-    � Gold-outlined cells mark each method's current [[em]]"sweet-spot" ranks[[/em]].
+    • The [[strong]]red side on the left (low rank numbers)[[/strong]] shows early picks.  
+    • The [[strong]]blue side on the right (high rank numbers)[[/strong]] shows later picks.  
+    • Darker cells mean [[em]]more hits[[/em]] at that rank.  
+    • Gold-outlined cells mark each method's current [[em]]"sweet-spot" ranks[[/em]].
     [[br]][[br]]
 
 
@@ -6300,7 +6310,7 @@ $peakCols = array_values(array_filter($peakCols, function ($k) use ($placementSt
     [[span style="display:inline-block; width:16px; height:10px; background:#FF0000; margin-right:.35rem;"]][[/span]] Rank #1 (hot)
     &nbsp;?&nbsp;
     [[span style="display:inline-block; width:16px; height:10px; background:#0000FF; margin:0 .35rem 0 .55rem;"]][[/span]] Rank #<?php echo $__maxRankMain; ?> (cool)
-    &nbsp;�&nbsp; Gold outline = peak columns for that method
+    &nbsp;•&nbsp; Gold outline = peak columns for that method
   [[/div]]
   
   <?php
@@ -6390,7 +6400,7 @@ $peakCols = array_values(array_filter($peakCols, function ($k) use ($placementSt
 
   [[div style="font-size:0.85rem; color:#4a5568; line-height:1.4;"]]
     [[strong]]Per-method pattern:[[/strong]]
-    [[em]]<?php echo htmlspecialchars(implode('  �  ', $perMethodSummaries), ENT_QUOTES); ?>[[/em]]
+    [[em]]<?php echo htmlspecialchars(implode('  •  ', $perMethodSummaries), ENT_QUOTES); ?>[[/em]]
     [[br]]
     [[span style="opacity:0.9;"]]
       Tip: Aim to match more of your chosen numbers where methods score early (ranks #1-#5), and use later ranks as secondary numbers.
@@ -7045,7 +7055,7 @@ if ($__rawSettingsJson !== null):
   [[input type="text"
           name="setting_name"
           value="<?php echo $defaultName; ?>"
-          placeholder="Save as template�"
+          placeholder="Save as template..."
           style="width:100%; padding:6px; margin-bottom:6px; font-size:.9rem;"]]
 
   [[button type="submit" class="btn-primary"
@@ -7156,7 +7166,7 @@ $savedSettings = $db->loadAssocList() ?: [];
             $sourceLabel = ucfirst(str_replace('_', ' ', $set['source']));
             $state       = htmlspecialchars($set['state_name'] ?? 'Unknown', ENT_QUOTES);
             $lotteryName = htmlspecialchars($set['lottery_name'] ?? 'Unknown', ENT_QUOTES);
-            echo "$sourceLabel for $state � $lotteryName";
+            echo "$sourceLabel for $state - $lotteryName";
           ?>
           [[br]]
           [[em]]<?php echo date('M j, Y g:ia', strtotime($set['created_at'])); ?>[[/em]]
@@ -7167,9 +7177,9 @@ $savedSettings = $db->loadAssocList() ?: [];
                 // human-friendly labels
                 $labels = [
                   'draws_analyzed'      => 'Draws',
-                  'freq_weight'         => 'Freq�Wt',
-                  'skip_weight'         => 'Skip�Wt',
-                  'hist_weight'         => 'Hist�Wt',
+                  'freq_weight'         => 'Freq Wt',
+                  'skip_weight'         => 'Skip Wt',
+                  'hist_weight'         => 'Hist Wt',
                   'epochs'              => 'Epochs',
                   'batch_size'          => 'Batch',
                   'dropout_rate'        => 'Dropout',
@@ -7178,16 +7188,16 @@ $savedSettings = $db->loadAssocList() ?: [];
                   'hidden_layers'       => 'Layers',
                   'walks'               => 'Walks',
                   'burn_in'             => 'Burn-in',
-                  'laplace_k'           => 'Laplace�K',
+                  'laplace_k'           => 'Laplace K',
                   'decay'               => 'Decay',
-                  'chain_len'           => 'Chain�Len',
+                  'chain_len'           => 'Chain Len',
                 ];
                 $parts = [];
                 foreach ($params as $key => $val) {
                   $lbl = $labels[$key] ?? ucwords(str_replace('_',' ',$key));
                   $parts[] = htmlspecialchars($lbl, ENT_QUOTES) . ': ' . htmlspecialchars($val, ENT_QUOTES);
                 }
-                echo implode('�|�', $parts);
+                echo implode(' | ', $parts);
               ?>
             [[/div]]
           <?php endif; ?>
