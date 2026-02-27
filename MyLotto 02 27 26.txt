@@ -1093,6 +1093,9 @@ if (!empty($unionSql)) {
 
 $bestOpps = array();
 
+// Per-game+date draw cache used by the fallback below (avoids repeated DB queries).
+$__drawCache = array();
+
 // Shared rank comparator: hits desc -> extra_hits desc -> rank_score desc -> run_id desc
 $__rankCompare = function (array $a, array $b) {
     if ($a['hits'] !== $b['hits']) { return $b['hits'] - $a['hits']; }
@@ -1173,6 +1176,60 @@ foreach ($groups as $groupKey => $g) {
         }
 
         $__scored = scoreRunFromDrawMap($drawMap, (int)$g['game_id'], (string)$g['draw_date'], $predMain, $predExtra);
+
+        // ── Fallback: when the UNION-ALL/drawMap path has no data for this
+        //    game+date (common for regular lotteries without an extra ball or
+        //    when the UNION ALL query failed), fall back to a direct DB lookup –
+        //    same two-phase logic used by the per-draw-group rendering code. ──
+        if (!$__scored['has_draw']) {
+            $__bkTs  = strtotime((string)$g['draw_date']);
+            $__bkKey = (int)$g['game_id'] . ':' . ($__bkTs ? date('Y-m-d', $__bkTs) : (string)$g['draw_date']);
+            if (!array_key_exists($__bkKey, $__drawCache)) {
+                $__bkRow    = getDrawByDate((int)$g['game_id'], (string)$g['draw_date'], $db);
+                $__bkMain   = array();
+                $__bkExtra  = array();
+                if ($__bkRow !== null) {
+                    if (array_key_exists('main_0', $__bkRow)) {
+                        // Row came from $drawMap (normalized fields)
+                        for ($__bi = 0; $__bi < 25; $__bi++) {
+                            $__bk = 'main_' . $__bi;
+                            if (isset($__bkRow[$__bk]) && $__bkRow[$__bk] !== '' && $__bkRow[$__bk] !== null) {
+                                $__bv = (int)$__bkRow[$__bk];
+                                if ($__bv) { $__bkMain[] = $__bv; }
+                            }
+                        }
+                        if (isset($__bkRow['extra_ball']) && $__bkRow['extra_ball'] !== '' && $__bkRow['extra_ball'] !== null) {
+                            $__bv = (int)$__bkRow['extra_ball'];
+                            if ($__bv) { $__bkExtra[] = $__bv; }
+                        }
+                    } else {
+                        // Raw row: use config column names (same as per-card fallback)
+                        $__bkFields = getDrawFields((int)$g['game_id']);
+                        foreach (($__bkFields['main'] ?? array()) as $__bc) {
+                            if (isset($__bkRow[$__bc]) && $__bkRow[$__bc] !== '') { $__bkMain[] = (int)$__bkRow[$__bc]; }
+                        }
+                        if (!empty($__bkFields['extra']) && isset($__bkRow[$__bkFields['extra']]) && $__bkRow[$__bkFields['extra']] !== '') {
+                            $__bkExtra[] = (int)$__bkRow[$__bkFields['extra']];
+                        }
+                    }
+                }
+                $__drawCache[$__bkKey] = array('main' => $__bkMain, 'extra' => $__bkExtra);
+            }
+            $__bkDraw = $__drawCache[$__bkKey];
+            if (!empty($__bkDraw['main'])) {
+                $__hm = 0; $__he = 0;
+                foreach ($predMain as $__pn) { if ($__pn && in_array($__pn, $__bkDraw['main'], true)) $__hm++; }
+                if ($predExtra > 0 && !empty($__bkDraw['extra']) && in_array($predExtra, $__bkDraw['extra'], true)) $__he = 1;
+                $__scored = array(
+                    'has_draw'   => true,
+                    'hits_main'  => $__hm,
+                    'hits_extra' => $__he,
+                    'drawMain'   => $__bkDraw['main'],
+                    'drawExtra'  => $__bkDraw['extra'],
+                );
+            }
+        }
+
         if (!$__scored['has_draw']) {
             continue; // draw not yet available; skip this run
         }
@@ -1180,6 +1237,7 @@ foreach ($groups as $groupKey => $g) {
         $mainHitCount  = (int)$__scored['hits_main'];
         $extraHitCount = (int)$__scored['hits_extra'];
         $actualMain    = $__scored['drawMain'];
+        $actualExtra   = $__scored['drawExtra'];
 
         // Position sum for tie-breaking
         $posSum = 0;
@@ -1201,6 +1259,7 @@ foreach ($groups as $groupKey => $g) {
             'pred_main'    => $predMain,
             'pred_extra'   => $predExtra,
             'actual_main'  => $actualMain,
+            'actual_extra' => $actualExtra,
             'has_draw'     => true,
         );
     }
@@ -1413,33 +1472,36 @@ foreach ($groups as $__gKey => $__g) {
                 }
                 // Synthesise a scored entry so the rest of the loop behaves identically
                 $__scored = array(
-                    'run_id'      => $__rid,
-                    'hits'        => $__fbMainHits,
-                    'extra_hits'  => $__fbExtraHits,
-                    'actual_main' => $__fb['drawMain'],
+                    'run_id'       => $__rid,
+                    'hits'         => $__fbMainHits,
+                    'extra_hits'   => $__fbExtraHits,
+                    'actual_main'  => $__fb['drawMain'],
+                    'actual_extra' => $__fb['drawExtra'],
                 );
             }
         }
 
-        $__mainHits   = ($__scored !== null) ? (int)$__scored['hits']       : null;
-        $__extraHits  = ($__scored !== null) ? (int)$__scored['extra_hits'] : null;
-        $__actualMain = ($__scored !== null) ? $__scored['actual_main']     : array();
+        $__mainHits   = ($__scored !== null) ? (int)$__scored['hits']          : null;
+        $__extraHits  = ($__scored !== null) ? (int)$__scored['extra_hits']   : null;
+        $__actualMain = ($__scored !== null) ? ($__scored['actual_main'] ?? array()) : array();
+        $__actualExtra = ($__scored !== null) ? ($__scored['actual_extra'] ?? array()) : array();
         $__totalHits = (int)($__mainHits ?? 0) + (int)($__extraHits ?? 0);
         if ($__totalHits > $__runSummary[$__lid]['max_hits']) {
             $__runSummary[$__lid]['max_hits']    = $__totalHits;
             $__runSummary[$__lid]['best_run_id'] = $__rid;
         }
         $__runSummary[$__lid]['runs'][] = array(
-            'run_id'       => $__rid,
-            'draw_date'    => (string)($__g['draw_date'] ?? ''),
-            'source'       => (string)$__pred->source,
-            'pred_main'    => $__predNums,
-            'pred_extra'   => $__predExtra,
-            'actual_main'  => $__actualMain,
-            'hits_main'    => $__mainHits,
-            'hits_extra'   => $__extraHits,
-            'has_draw'     => ($__scored !== null),
-            'disp'         => isset($__runDispInfo[$__rid]) ? $__runDispInfo[$__rid] : array('base_label'=>'','mode'=>'','label'=>'','source'=>$__pred->source),
+            'run_id'        => $__rid,
+            'draw_date'     => (string)($__g['draw_date'] ?? ''),
+            'source'        => (string)$__pred->source,
+            'pred_main'     => $__predNums,
+            'pred_extra'    => $__predExtra,
+            'actual_main'   => $__actualMain,
+            'actual_extra'  => $__actualExtra,
+            'hits_main'     => $__mainHits,
+            'hits_extra'    => $__extraHits,
+            'has_draw'      => ($__scored !== null),
+            'disp'          => isset($__runDispInfo[$__rid]) ? $__runDispInfo[$__rid] : array('base_label'=>'','mode'=>'','label'=>'','source'=>$__pred->source),
         );
     }
 }
@@ -2768,9 +2830,17 @@ foreach ($bestOpps as $__sopp) {
             [[/td]]
             [[td]]
               <?php if ($__prHasD && !empty($__pr['actual_main'])): ?>
-                <?php foreach ($__pr['actual_main'] as $__an): ?>
-                  [[span class="prc-num"]]<?php echo (int)$__an; ?>[[/span]]
-                <?php endforeach; ?>
+                <?php
+                  // Green for actual numbers that were predicted (matched)
+                  $__predLookup = array_flip((array)$__pr['pred_main']);
+                  foreach ($__pr['actual_main'] as $__an):
+                    $__anHit = isset($__predLookup[(int)$__an]);
+                ?>[[span class="prc-num <?php echo $__anHit ? 'prc-num-hit' : ''; ?>"]]<?php echo (int)$__an; ?>[[/span]]<?php endforeach; ?>
+                <?php if (!empty($__pr['actual_extra'])): ?>
+                  <?php foreach ($__pr['actual_extra'] as $__en):
+                    $__enHit = ($__pr['pred_extra'] > 0 && (int)$__en === (int)$__pr['pred_extra']); ?>
+                  [[span class="prc-num <?php echo $__enHit ? 'prc-num-extra' : 'prc-num-extra-miss'; ?>"]]<?php echo (int)$__en; ?>[[/span]]<?php endforeach; ?>
+                <?php endif; ?>
               <?php elseif (!$__prHasD): ?>
                 [[span class="prc-pending-lbl"]]Upcoming[[/span]]
               <?php else: ?>
@@ -2790,8 +2860,12 @@ foreach ($bestOpps as $__sopp) {
             [[/td]]
             [[td class="prc-hits-cell"]]
               <?php if ($__prHasD): ?>
-                <?php if ((int)($__prExtraHits ?? 0) > 0): ?>
-                  [[span class="prc-extra"]]&#x2713;[[/span]]
+                <?php if (!empty($__pr['actual_extra'])): ?>
+                  <?php foreach ($__pr['actual_extra'] as $__exn):
+                    $__exHit = ($__pr['pred_extra'] > 0 && (int)$__exn === (int)$__pr['pred_extra']); ?>
+                  [[span class="prc-num <?php echo $__exHit ? 'prc-num-extra' : 'prc-num-extra-miss'; ?>"]]<?php echo (int)$__exn; ?>[[/span]]
+                  <?php if ($__exHit): ?>[[span class="prc-extra"]] &#x2713;[[/span]]<?php endif; ?>
+                  <?php endforeach; ?>
                 <?php else: ?>
                   [[span class="prc-hits-zero"]]—[[/span]]
                 <?php endif; ?>
