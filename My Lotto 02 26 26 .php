@@ -1990,8 +1990,38 @@ function getDrawByDate($gameId, $date, $db)
     return $bestRow;
 }
 /**
+ * getExtraColFromConfig: Resolve the extra-ball column name from a lotteryConfig entry.
+ *
+ * Handles both the singular key ("extra_ball_column": "sixth") used by most lotteries
+ * and the plural key ("extra_ball_columns": ["sixth","seventh"]) used by EuroMillions,
+ * Thunderball, and Lunchtime 49s.  Returns the first column name found, or null.
+ *
+ * @param  array  $lcfg  The lotteryConfig sub-object from lottery_skip_config.json
+ * @return string|null
+ */
+function getExtraColFromConfig(array $lcfg): ?string
+{
+    // Singular key first (most common path).
+    if (isset($lcfg['extra_ball_column']) && is_string($lcfg['extra_ball_column'])) {
+        $col = trim($lcfg['extra_ball_column']);
+        if ($col !== '') {
+            return $col;
+        }
+    }
+    // Plural key fallback (EuroMillions, Thunderball, Lunchtime 49s).
+    if (isset($lcfg['extra_ball_columns']) && is_array($lcfg['extra_ball_columns'])) {
+        foreach ($lcfg['extra_ball_columns'] as $col) {
+            if (is_string($col) && trim($col) !== '') {
+                return trim($col);
+            }
+        }
+    }
+    return null;
+}
+
+/**
  * getDrawFields: For a given gameId, read 'lottery_skip_config.json' to find which columns in the draw table
- * represent 'main_ball_columns' and 'extra_ball_column'.
+ * represent 'main_ball_columns' and 'extra_ball_column' / 'extra_ball_columns'.
  *
  * @param   mixed $gameId  Lottery game ID
  * @return  array          ['main' => array of column names, 'extra' => column name or null]
@@ -2010,7 +2040,7 @@ function getDrawFields($gameId)
 
     $config   = $json['lotteries'][$gameId]['lotteryConfig'];
     $mainCols = $config['main_ball_columns'] ?? [];
-    $extraCol = $config['extra_ball_column'] ?? null;
+    $extraCol = getExtraColFromConfig($config);
 
     // Normalize mains
     if (!is_array($mainCols)) {
@@ -2019,17 +2049,6 @@ function getDrawFields($gameId)
     $mainCols = array_values(array_filter(array_map('trim', $mainCols), function ($v) {
         return $v !== '';
     }));
-
-    // Normalize extra
-    if (is_string($extraCol)) {
-        $extraCol = trim($extraCol);
-        if ($extraCol === '') {
-            $extraCol = null;
-        }
-    }
-    if (!is_string($extraCol)) {
-        $extraCol = null;
-    }
 
     // Safety: if extra column equals one of the main columns, disable it
     if ($extraCol !== null && in_array($extraCol, $mainCols, true)) {
@@ -2319,7 +2338,7 @@ function resolvePredictionLines($savedRow, array $lotteryCfg): array
         $cfgMainCols = [];
     }
     $expectedCount = count(array_filter(array_map('trim', $cfgMainCols), static function ($c) { return $c !== ''; }));
-    $hasExtraBall  = !empty($lotteryConfig['extra_ball_column']);
+    $hasExtraBall  = (getExtraColFromConfig($lotteryConfig) !== null);
 
     $toInts = static function (array $raw): array {
         return array_values(array_filter(array_map('intval', $raw), static function ($n) { return $n > 0; }));
@@ -2446,8 +2465,7 @@ function resolveDrawNumbers($db, $gameId, $drawDate, array $lotteryCfg, array $d
     $mainCols = is_array($rawCols)
         ? array_values(array_filter(array_map('trim', $rawCols), static function ($c) { return $c !== ''; }))
         : [];
-    $extraColRaw = isset($lcfg['extra_ball_column']) ? trim((string)$lcfg['extra_ball_column']) : '';
-    $extraCol    = $extraColRaw !== '' ? $extraColRaw : null;
+    $extraCol = getExtraColFromConfig($lcfg);
 
     if ($tblName === '') {
         return array_merge($notFound, ['reason' => 'config_error: missing table name (dbCol)']);
@@ -2876,7 +2894,7 @@ foreach ($savedSets as $s) {
         $tableInfo[$s->game_id] = array(
             'table' => $spec['dbCol'] ?? '',
             'main'  => $spec['lotteryConfig']['main_ball_columns'] ?? array(),
-            'extra' => $spec['lotteryConfig']['extra_ball_column'] ?? null,
+            'extra' => getExtraColFromConfig($spec['lotteryConfig'] ?? array()),
         );
     }
 }
