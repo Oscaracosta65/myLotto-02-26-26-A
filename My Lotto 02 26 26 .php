@@ -1339,8 +1339,8 @@ foreach ($bestOpps as $__sid => $__sopp) {
 }
 .skai-lottery-summary__chip b { color: #0A1A33; }
 
-/* Top Hits hero styling (agency-grade upgrade)
-   We elevate the Most Hits metric to hero status with clear hierarchy.
+/* Topâ€¢Hits hero styling (agency-grade upgrade)
+   We elevate the Mostâ€¢Hits metric to hero status with clear hierarchy.
    The badge uses the primary accent colour; the number is large and bold;
    supporting lines use muted colours for readability. */
 .skai-opp-hero {
@@ -1349,7 +1349,7 @@ foreach ($bestOpps as $__sid => $__sopp) {
   align-items: flex-start;
   margin-bottom: 0.75rem;
 }
-/* Badge indicating this card shows Top Hits */
+/* Badge indicating this card shows Topâ€¢Hits */
 .skai-opp-hero-badge {
   font-size: 0.65rem;
   letter-spacing: 0.08em;
@@ -1990,8 +1990,45 @@ function getDrawByDate($gameId, $date, $db)
     return $bestRow;
 }
 /**
+ * getExtraColFromConfig: Resolve the extra-ball column name from a lotteryConfig entry.
+ *
+ * Handles both the singular key ("extra_ball_column": "sixth") used by most lotteries
+ * and the plural key ("extra_ball_columns": ["sixth","seventh"]) used by EuroMillions,
+ * Thunderball, and Lunchtime 49s.  Returns the first column name found, or null.
+ *
+ * @param  array  $lcfg  The lotteryConfig sub-object from lottery_skip_config.json
+ * @return string|null
+ */
+function getExtraColFromConfig(array $lcfg): ?string
+{
+    // Respect the explicit has_extra_ball flag. When the config author sets it to
+    // false (e.g. Gimme 5) there is no extra ball regardless of what column names
+    // appear in the config, and we must return null so the game is not treated as
+    // an extra-ball game.
+    if (isset($lcfg['has_extra_ball']) && !$lcfg['has_extra_ball']) {
+        return null;
+    }
+    // Singular key first (most common path).
+    if (isset($lcfg['extra_ball_column']) && is_string($lcfg['extra_ball_column'])) {
+        $col = trim($lcfg['extra_ball_column']);
+        if ($col !== '') {
+            return $col;
+        }
+    }
+    // Plural key fallback (EuroMillions, Thunderball, Lunchtime 49s).
+    if (isset($lcfg['extra_ball_columns']) && is_array($lcfg['extra_ball_columns'])) {
+        foreach ($lcfg['extra_ball_columns'] as $col) {
+            if (is_string($col) && trim($col) !== '') {
+                return trim($col);
+            }
+        }
+    }
+    return null;
+}
+
+/**
  * getDrawFields: For a given gameId, read 'lottery_skip_config.json' to find which columns in the draw table
- * represent 'main_ball_columns' and 'extra_ball_column'.
+ * represent 'main_ball_columns' and 'extra_ball_column' / 'extra_ball_columns'.
  *
  * @param   mixed $gameId  Lottery game ID
  * @return  array          ['main' => array of column names, 'extra' => column name or null]
@@ -2010,7 +2047,7 @@ function getDrawFields($gameId)
 
     $config   = $json['lotteries'][$gameId]['lotteryConfig'];
     $mainCols = $config['main_ball_columns'] ?? [];
-    $extraCol = $config['extra_ball_column'] ?? null;
+    $extraCol = getExtraColFromConfig($config);
 
     // Normalize mains
     if (!is_array($mainCols)) {
@@ -2019,17 +2056,6 @@ function getDrawFields($gameId)
     $mainCols = array_values(array_filter(array_map('trim', $mainCols), function ($v) {
         return $v !== '';
     }));
-
-    // Normalize extra
-    if (is_string($extraCol)) {
-        $extraCol = trim($extraCol);
-        if ($extraCol === '') {
-            $extraCol = null;
-        }
-    }
-    if (!is_string($extraCol)) {
-        $extraCol = null;
-    }
 
     // Safety: if extra column equals one of the main columns, disable it
     if ($extraCol !== null && in_array($extraCol, $mainCols, true)) {
@@ -2167,7 +2193,7 @@ function getActualDrawNumbers($gameId, $drawDate, array $drawMap, $db)
  * }
  */
 
-function scoreRunAgainstDraw($db, $gameId, $drawDate, array $predMain, $predExtra = 0): array
+function scoreRunAgainstDraw($db, $gameId, $drawDate, array $predMain, $predExtra = 0, array $drawMap = []): array
 {
     static $__drawCache = [];
 
@@ -2202,7 +2228,15 @@ function scoreRunAgainstDraw($db, $gameId, $drawDate, array $predMain, $predExtr
     $cacheKey = (int)$gameId . '|' . $normDate . '|' . $subKey;
 
     if (!array_key_exists($cacheKey, $__drawCache)) {
-        $__drawCache[$cacheKey] = getDrawByDate($gameId, $drawDate, $db);
+        // Prefer the preloaded $drawMap (normalized main_0/main_1/extra_ball keys) so that
+        // regular lotteries without extra balls are scored using the same data source as
+        // the prediction cards, avoiding getDrawFields() column-name mismatches.
+        $mapKey = (int)$gameId . '|' . $normDate;
+        if (!empty($drawMap) && isset($drawMap[$mapKey])) {
+            $__drawCache[$cacheKey] = $drawMap[$mapKey];
+        } else {
+            $__drawCache[$cacheKey] = getDrawByDate($gameId, $drawDate, $db);
+        }
     }
 
     $draw = $__drawCache[$cacheKey];
@@ -2278,9 +2312,282 @@ function scoreRunAgainstDraw($db, $gameId, $drawDate, array $predMain, $predExtr
     ];
 }
 
-function getDrawAndScoreRun($db, $gameId, $drawDate, array $predMain, $predExtra = 0)
+function getDrawAndScoreRun($db, $gameId, $drawDate, array $predMain, $predExtra = 0, array $drawMap = [])
 {
-    return scoreRunAgainstDraw($db, $gameId, $drawDate, $predMain, $predExtra);
+    return scoreRunAgainstDraw($db, $gameId, $drawDate, $predMain, $predExtra, $drawMap);
+}
+
+/**
+ * resolvePredictionLines: Canonical resolver for predicted ball numbers from a saved run.
+ *
+ * Returns an array of scorable prediction lines, each as:
+ *   ['main' => [int...], 'extra' => [int...]]
+ *
+ * Priority order:
+ *   1. top_combos_json (if present and valid JSON): authoritative predicted lines.
+ *      Supports formats: flat array of ints, list with 'main'/'numbers' keys.
+ *   2. position_combinations (if present and valid JSON): derive lines from positional data.
+ *   3. main_numbers fallback: used ONLY when the count matches the expected main ball count
+ *      from config. A larger count (pool/ranked list) is rejected; [] is returned.
+ *
+ * For games with no extra ball, all 'extra' arrays will be [].
+ * Returns [] when no scorable lines can be resolved.
+ *
+ * @param  object  $savedRow    DB row from #__user_saved_numbers
+ * @param  array   $lotteryCfg  Entry from lottery_skip_config.json['lotteries'][$gameId]
+ * @return array                Array of lines: [['main' => int[], 'extra' => int[]], ...]
+ */
+function resolvePredictionLines($savedRow, array $lotteryCfg): array
+{
+    $lotteryConfig = $lotteryCfg['lotteryConfig'] ?? [];
+    $cfgMainCols   = $lotteryConfig['main_ball_columns'] ?? [];
+    if (!is_array($cfgMainCols)) {
+        $cfgMainCols = [];
+    }
+    $expectedCount = count(array_filter(array_map('trim', $cfgMainCols), static function ($c) { return $c !== ''; }));
+    $hasExtraBall  = (getExtraColFromConfig($lotteryConfig) !== null);
+
+    $toInts = static function (array $raw): array {
+        return array_values(array_filter(array_map('intval', $raw), static function ($n) { return $n > 0; }));
+    };
+
+    // --- 1. top_combos_json ---
+    if (!empty($savedRow->top_combos_json)) {
+        $decoded = json_decode((string)$savedRow->top_combos_json, true);
+        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+            $lines = [];
+            foreach ($decoded as $entry) {
+                if (!is_array($entry)) {
+                    continue;
+                }
+                if (array_key_exists('main', $entry)) {
+                    $mainNums  = $toInts((array)$entry['main']);
+                    $extraNums = $hasExtraBall ? $toInts((array)($entry['extra'] ?? [])) : [];
+                } elseif (array_key_exists('numbers', $entry)) {
+                    $mainNums  = $toInts((array)$entry['numbers']);
+                    $extraNums = $hasExtraBall ? $toInts((array)($entry['extra'] ?? [])) : [];
+                } else {
+                    $mainNums  = $toInts(array_values($entry));
+                    $extraNums = [];
+                }
+                if (!empty($mainNums)) {
+                    $lines[] = ['main' => $mainNums, 'extra' => $extraNums];
+                }
+            }
+            if (!empty($lines)) {
+                return $lines;
+            }
+        }
+    }
+
+    // --- 2. position_combinations ---
+    if (!empty($savedRow->position_combinations)) {
+        $decoded = json_decode((string)$savedRow->position_combinations, true);
+        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+            $lines = [];
+            foreach ($decoded as $entry) {
+                if (!is_array($entry)) {
+                    continue;
+                }
+                $mainNums = $toInts(array_values($entry));
+                if (!empty($mainNums)) {
+                    $lines[] = ['main' => $mainNums, 'extra' => []];
+                }
+            }
+            if (!empty($lines)) {
+                return $lines;
+            }
+        }
+    }
+
+    // --- 3. main_numbers fallback ---
+    // When count > expectedCount (ranked list saved as main_numbers, e.g. heatmap):
+    //   take the first expectedCount numbers as a single scorable line.
+    // When count < expectedCount (sparse/partial prediction): still score what we have.
+    $mainRaw  = array_map('intval', explode(',', (string)($savedRow->main_numbers ?? '')));
+    $mainNums = $toInts($mainRaw);
+
+    if (empty($mainNums)) {
+        return [];
+    }
+
+    if ($expectedCount > 0 && count($mainNums) > $expectedCount) {
+        // Silently truncate: heatmap and similar methods save a ranked candidate pool
+        // rather than a single exact combo; take the top-N as the scorable line.
+        $mainNums = array_slice($mainNums, 0, $expectedCount);
+    }
+
+    $extraNums = [];
+    if ($hasExtraBall) {
+        if (!empty($savedRow->extra_ball_numbers)) {
+            $extraNums = $toInts(array_map('intval', explode(',', (string)$savedRow->extra_ball_numbers)));
+        } elseif (!empty($savedRow->extra_number)) {
+            $v = (int)$savedRow->extra_number;
+            if ($v > 0) {
+                $extraNums = [$v];
+            }
+        } elseif (!empty($savedRow->extra_numbers)) {
+            $extraNums = $toInts(array_map('intval', explode(',', (string)$savedRow->extra_numbers)));
+        } elseif (!empty($savedRow->bonus_number)) {
+            $v = (int)$savedRow->bonus_number;
+            if ($v > 0) {
+                $extraNums = [$v];
+            }
+        }
+    }
+
+    return [['main' => $mainNums, 'extra' => $extraNums]];
+}
+
+/**
+ * resolveDrawNumbers: Canonical resolver for actual drawn ball numbers.
+ *
+ * Uses lottery_skip_config.json as the single source of truth for table name,
+ * main ball columns, and extra ball column. No runtime column guessing.
+ *
+ * Distinct error categories returned in 'reason':
+ *   config_error:      missing/incomplete config entry (table, columns, or date)
+ *   draw_not_found:    draw table queried but no row found for this game/date
+ *   draw_parse_error:  row found but configured main columns are missing/empty
+ *   scored:            draw extracted successfully
+ *
+ * Results are cached per (gameId|Y-m-d) for the request lifetime.
+ *
+ * @param  JDatabaseDriver  $db
+ * @param  int              $gameId
+ * @param  string           $drawDate     Any strtotime-parsable date string
+ * @param  array            $lotteryCfg   Entry from lottery_skip_config.json['lotteries'][$gameId]
+ * @return array  ['has_draw'=>bool, 'main'=>int[], 'extra'=>int[], 'reason'=>string, 'draw_row'=>array|null]
+ */
+function resolveDrawNumbers($db, $gameId, $drawDate, array $lotteryCfg, array $drawMap = []): array
+{
+    static $__rdnCache = [];
+
+    $notFound = ['has_draw' => false, 'main' => [], 'extra' => [], 'reason' => 'draw_not_found', 'draw_row' => null];
+
+    // --- Validate config ---
+    $tblName  = isset($lotteryCfg['dbCol']) ? trim((string)$lotteryCfg['dbCol']) : '';
+    $lcfg     = $lotteryCfg['lotteryConfig'] ?? [];
+    $rawCols  = $lcfg['main_ball_columns'] ?? [];
+    $mainCols = is_array($rawCols)
+        ? array_values(array_filter(array_map('trim', $rawCols), static function ($c) { return $c !== ''; }))
+        : [];
+    $extraCol = getExtraColFromConfig($lcfg);
+
+    if ($tblName === '') {
+        return array_merge($notFound, ['reason' => 'config_error: missing table name (dbCol)']);
+    }
+    if (empty($mainCols)) {
+        return array_merge($notFound, ['reason' => 'config_error: no main_ball_columns configured']);
+    }
+
+    // --- Normalize date ---
+    $ts = strtotime((string)$drawDate);
+    if ($ts === false) {
+        return array_merge($notFound, ['reason' => 'config_error: invalid draw date']);
+    }
+    $normDate = date('Y-m-d', $ts);
+    $cacheKey = (int)$gameId . '|' . $normDate;
+
+    if (array_key_exists($cacheKey, $__rdnCache)) {
+        return $__rdnCache[$cacheKey];
+    }
+
+    // --- Layer 1: preloaded drawMap (normalized main_0/main_1/extra_ball keys from UNION query) ---
+    // This path is the most reliable because the UNION was built using the same config table+columns.
+    $drawRow = null;
+    if (!empty($drawMap) && isset($drawMap[$cacheKey])) {
+        $candidate = $drawMap[$cacheKey];
+        for ($__i = 0; $__i < 25; $__i++) {
+            $__mk = 'main_' . $__i;
+            if (array_key_exists($__mk, $candidate) && $candidate[$__mk] !== null && $candidate[$__mk] !== '') {
+                $drawRow = $candidate;
+                break;
+            }
+        }
+    }
+
+    // --- Layer 2: direct DB query via getDrawByDate (raw column names from SELECT *) ---
+    if ($drawRow === null) {
+        try {
+            $drawRow = getDrawByDate($gameId, $normDate, $db);
+        } catch (\Exception $e) {
+            $drawRow = null;
+        }
+    }
+
+    if (!$drawRow) {
+        $__rdnCache[$cacheKey] = $notFound;
+        return $notFound;
+    }
+
+    // --- Extract main numbers ---
+    // For drawMap rows use normalized main_0/main_1 keys; for raw DB rows use configured column names.
+    $main    = [];
+    $hasNorm = array_key_exists('main_0', $drawRow);
+
+    if ($hasNorm) {
+        for ($__i = 0; $__i < 25; $__i++) {
+            $__mk = 'main_' . $__i;
+            if (isset($drawRow[$__mk]) && $drawRow[$__mk] !== '' && $drawRow[$__mk] !== null) {
+                $v = (int)$drawRow[$__mk];
+                if ($v > 0) {
+                    $main[] = $v;
+                }
+            }
+        }
+    } else {
+        foreach ($mainCols as $col) {
+            if (isset($drawRow[$col]) && $drawRow[$col] !== '' && $drawRow[$col] !== null) {
+                $v = (int)$drawRow[$col];
+                if ($v > 0) {
+                    $main[] = $v;
+                }
+            }
+        }
+    }
+
+    if (empty($main)) {
+        $result = [
+            'has_draw' => false,
+            'main'     => [],
+            'extra'    => [],
+            'reason'   => 'draw_parse_error: main columns not found or empty in draw row',
+            'draw_row' => null,
+        ];
+        $__rdnCache[$cacheKey] = $result;
+        return $result;
+    }
+
+    // --- Extract extra ball ([] for no-extra-ball games) ---
+    $extra = [];
+    if ($hasNorm) {
+        // drawMap row: extra_ball normalized key
+        if ($extraCol !== null
+            && array_key_exists('extra_ball', $drawRow)
+            && $drawRow['extra_ball'] !== null
+            && $drawRow['extra_ball'] !== '') {
+            $v = (int)$drawRow['extra_ball'];
+            if ($v > 0) {
+                $extra = [$v];
+            }
+        }
+    } else {
+        // raw DB row: use configured extra column name
+        if ($extraCol !== null
+            && isset($drawRow[$extraCol])
+            && $drawRow[$extraCol] !== ''
+            && $drawRow[$extraCol] !== null) {
+            $v = (int)$drawRow[$extraCol];
+            if ($v > 0) {
+                $extra = [$v];
+            }
+        }
+    }
+
+    $result = ['has_draw' => true, 'main' => $main, 'extra' => $extra, 'reason' => 'scored', 'draw_row' => null];
+    $__rdnCache[$cacheKey] = $result;
+    return $result;
 }
 
 /**
@@ -2407,9 +2714,30 @@ function buildLotteryLogoPath(string $stateName, string $gameName): array
 // Load Data: Saved Predictions
 // --------------------------------------------------
 
+// Probe the actual columns present in #__user_saved_numbers so the SELECT
+// never requests a column that does not yet exist in an older schema.
+$__snTable = $db->replacePrefix('#__user_saved_numbers');
+$__snCols  = array();
+try {
+    $__snColRows = $db->setQuery('SHOW COLUMNS FROM ' . $db->quoteName($__snTable))->loadAssocList('Field') ?: array();
+    $__snCols = array_keys($__snColRows);
+} catch (Exception $e) {
+    $__snCols = array(); // fallback: add nothing optional
+}
+// Helper: return a safe SQL expression for an optional sn-alias column.
+// When the column exists: "sn.`colname`"
+// When absent:            "NULL AS `colname`" (property still available on each row object)
+$__snCol = function ($col) use ($__snCols, $db) {
+    if (in_array($col, $__snCols, true)) {
+        return 'sn.' . $db->quoteName($col);
+    }
+    return 'NULL AS ' . $db->quoteName($col);
+};
+
 // 1) Fetch saved predictions with timestamps
 $q = $db->getQuery(true);
-$q->select(array(
+// Core columns (always present â€“ created with the original table)
+$__snSelect = array(
     'sn.id','sn.lottery_id','sn.next_draw_date','sn.source','sn.label','sn.main_numbers',
     'sn.extra_ball_numbers','sn.date_saved','sn.generated_at',
 
@@ -2426,10 +2754,17 @@ $q->select(array(
     'sn.skai_top_n_numbers','sn.skai_top_n_combos',
     'sn.digit_probabilities',
     'l.game_id','l.name AS lottery_name',
-    'sn.pure_mode'
-
-
-));
+    'sn.pure_mode',
+);
+// Optional columns added in later schema revisions â€“ safe NULL fallback when absent.
+$__snOptional = array(
+    'pure_uid', 'top_combos_json', 'position_combinations',
+    'tuned_window', 'extra_number', 'extra_numbers', 'bonus_number',
+);
+foreach ($__snOptional as $__optCol) {
+    $__snSelect[] = $__snCol($__optCol);
+}
+$q->select($__snSelect);
 $q->from($db->quoteName('#__user_saved_numbers', 'sn'));
 $q->join('LEFT', $db->quoteName('#__lotteries', 'l') . ' ON sn.lottery_id = l.lottery_id');
 
@@ -2566,7 +2901,7 @@ foreach ($savedSets as $s) {
         $tableInfo[$s->game_id] = array(
             'table' => $spec['dbCol'] ?? '',
             'main'  => $spec['lotteryConfig']['main_ball_columns'] ?? array(),
-            'extra' => $spec['lotteryConfig']['extra_ball_column'] ?? null,
+            'extra' => getExtraColFromConfig($spec['lotteryConfig'] ?? array()),
         );
     }
 }
@@ -2606,7 +2941,7 @@ foreach ($groups as $g) {
 
     for ($i = 0; $i < $maxMain; $i++) {
         if (!empty($tableInfo[$tblKeyInt]['main'][$i])) {
-            // Alias each main ball column to a normalized name: main_0, main_1, …
+            // Alias each main ball column to a normalized name: main_0, main_1, main_2, ...
             $cols[] = $db->quoteName($tableInfo[$tblKeyInt]['main'][$i]) . ' AS main_' . $i; // CHANGED: added alias
         } else {
             $cols[] = 'NULL AS main_' . $i;
@@ -2748,17 +3083,31 @@ foreach ($groups as $groupKey => $g) {
     }
     $bestOpps[$lid]['total_runs'] += count($g['preds']);
 
-    // -- Agreement: per-run scoring --
+    // -- Agreement: per-run scoring (uses canonical prediction resolver) --
+    $__aCfg = $configData['lotteries'][(int)$g['game_id']] ?? [];
     $allSourceNumPool = [];
     foreach ($g['preds'] as $s) {
-        $src  = (string)$s->source;
-        $nums = array_filter(array_map('intval', explode(',', (string)($s->main_numbers ?? ''))));
-        if (!isset($allSourceNumPool[$src])) $allSourceNumPool[$src] = [];
-        foreach ($nums as $n) $allSourceNumPool[$src][$n] = true;
+        $src   = (string)$s->source;
+        $lines = resolvePredictionLines($s, $__aCfg);
+        if (!isset($allSourceNumPool[$src])) {
+            $allSourceNumPool[$src] = [];
+        }
+        foreach ($lines as $__aln) {
+            foreach ($__aln['main'] as $n) {
+                $allSourceNumPool[$src][$n] = true;
+            }
+        }
     }
     foreach ($g['preds'] as $s) {
-        $src    = (string)$s->source;
-        $myNums = array_filter(array_map('intval', explode(',', (string)($s->main_numbers ?? ''))));
+        $src      = (string)$s->source;
+        $__sLines = resolvePredictionLines($s, $__aCfg);
+        $__mySet  = [];
+        foreach ($__sLines as $__sln) {
+            foreach ($__sln['main'] as $n) {
+                $__mySet[$n] = true;
+            }
+        }
+        $myNums = array_keys($__mySet);
         $otherNums    = [];
         $otherSrcList = [];
         foreach ($allSourceNumPool as $otherSrc => $numSet) {
@@ -2791,62 +3140,80 @@ foreach ($groups as $groupKey => $g) {
         }
     }
 
-    // -- Rank Strength (Top-Hits Ranking): reward hits; tie-break by rank_score & run_id --
-    foreach ($g['preds'] as $s) {
-        // Extract predicted main numbers (zeros filtered out)
-        $predMain = array_values(
-            array_filter(
-                array_map('intval', explode(',', (string)($s->main_numbers ?? ''))),
-                static function ($n) { return $n !== 0; }
-            )
-        );
-        // Extract predicted extra ball (first non-zero value from any extra field)
-        $predExtra = 0;
-        if (isset($s->extra_ball_numbers) && $s->extra_ball_numbers !== '' && $s->extra_ball_numbers !== null) {
-            $tmp = array_values(array_filter(array_map('intval', explode(',', (string)$s->extra_ball_numbers))));
-            if (!empty($tmp)) { $predExtra = (int)$tmp[0]; }
-        } elseif (isset($s->extra_number) && $s->extra_number !== '' && $s->extra_number !== null) {
-            $predExtra = (int)$s->extra_number;
-        } elseif (isset($s->extra_numbers) && $s->extra_numbers !== '' && $s->extra_numbers !== null) {
-            $tmp = array_values(array_filter(array_map('intval', explode(',', (string)$s->extra_numbers))));
-            if (!empty($tmp)) { $predExtra = (int)$tmp[0]; }
-        } elseif (isset($s->bonus_number) && $s->bonus_number !== '' && $s->bonus_number !== null) {
-            $predExtra = (int)$s->bonus_number;
-        }
+    // -- Rank Strength (Top-Hits Ranking): canonical resolvers for draw and predictions --
+    $__rsCfg  = $configData['lotteries'][(int)$g['game_id']] ?? [];
+    $__rsDraw = resolveDrawNumbers($db, (int)$g['game_id'], (string)$g['draw_date'], $__rsCfg, $drawMap);
 
-        // Single source-of-truth: same draw lookup + hit computation as prediction cards
-        $__scored = getDrawAndScoreRun($db, (int)$g['game_id'], (string)$g['draw_date'], $predMain, $predExtra);
-        if (!$__scored['has_draw']) {
-            // Track awaiting run for debug output
+    foreach ($g['preds'] as $s) {
+        if (!$__rsDraw['has_draw']) {
             if ($__debugHits) {
                 $bestOpps[$lid]['awaiting_debug'][] = [
                     'run_id'    => (int)$s->id,
                     'game_id'   => (int)$g['game_id'],
                     'norm_date' => (string)$g['draw_date'],
                     'source'    => (string)$s->source,
-                    'reason'    => (string)($__scored['reason'] ?? 'unknown'),
+                    'reason'    => $__rsDraw['reason'],
                 ];
             }
-            continue; // draw not yet available; run stays in "awaiting" bucket
+            continue;
         }
 
-        $mainHitCount  = $__scored['hits_main'];
-        $extraHitCount = $__scored['hits_extra'];
-        $actualMain    = $__scored['drawMain'];
-        $actualExtra   = $__scored['drawExtra'][0] ?? 0;
+        $__predLines = resolvePredictionLines($s, $__rsCfg);
+        if (empty($__predLines)) {
+            if ($__debugHits) {
+                $bestOpps[$lid]['awaiting_debug'][] = [
+                    'run_id'    => (int)$s->id,
+                    'game_id'   => (int)$g['game_id'],
+                    'norm_date' => (string)$g['draw_date'],
+                    'source'    => (string)$s->source,
+                    'reason'    => 'prediction_parse_error: no scorable lines resolved from saved run',
+                ];
+            }
+            continue;
+        }
 
-        // Position sum for tie-breaking within equal hit counts
-        $posSum = 0;
-        foreach ($predMain as $pos0 => $n) {
-            if (in_array($n, $actualMain, true)) {
-                $posSum += ($pos0 + 1);
+        $actualMain  = $__rsDraw['main'];
+        $actualExtra = $__rsDraw['extra'];
+
+        // Score every resolved line; keep the best-scoring line for this run
+        $predMain      = [];
+        $predExtra     = 0;
+        $mainHitCount  = 0;
+        $extraHitCount = 0;
+        $matchedMain   = [];
+        $rankScore     = PHP_INT_MIN;
+
+        foreach ($__predLines as $__pl) {
+            $__lMain  = $__pl['main'];
+            $__lExtra = $__pl['extra'][0] ?? 0;
+
+            $__lHitsMain = 0;
+            foreach ($__lMain as $n) {
+                if (in_array($n, $actualMain, true)) {
+                    $__lHitsMain++;
+                }
+            }
+            $__lHitsExtra = ($__lExtra > 0 && !empty($actualExtra) && in_array($__lExtra, $actualExtra, true)) ? 1 : 0;
+
+            $__posSum = 0;
+            foreach ($__lMain as $__pos0 => $n) {
+                if (in_array($n, $actualMain, true)) {
+                    $__posSum += ($__pos0 + 1);
+                }
+            }
+            $__lRankScore = ($__lHitsMain * 10000) - $__posSum + ($__lHitsExtra * 1000);
+
+            if ($__lHitsMain > $mainHitCount
+                || ($__lHitsMain === $mainHitCount && $__lHitsExtra > $extraHitCount)
+                || ($__lHitsMain === $mainHitCount && $__lHitsExtra === $extraHitCount && $__lRankScore > $rankScore)) {
+                $mainHitCount  = $__lHitsMain;
+                $extraHitCount = $__lHitsExtra;
+                $predMain      = $__lMain;
+                $predExtra     = $__lExtra;
+                $matchedMain   = array_values(array_intersect($__lMain, $actualMain));
+                $rankScore     = $__lRankScore;
             }
         }
-
-        // Rank score: main hits dominate; earlier positions win ties; extra hit adds bonus
-        // Weights: main x10000, extra x1000 (> max posSum of ~210), position subtracted
-        $rankScore   = ($mainHitCount * 10000) - $posSum + ($extraHitCount * 1000);
-        $matchedMain = array_values(array_intersect($predMain, $actualMain));
 
         // Collect full scored-run data
         $bestOpps[$lid]['all_scored_runs'][] = [
@@ -4493,7 +4860,7 @@ uksort($__crrPresentSrcs, function ($a, $b) use ($__crrSourceOrder) {
   [[/span]]
 
   <?php if ($state && $state !== 'Lottery'): ?>
-    &nbsp;•&nbsp;
+    &nbsp;â€¢&nbsp;
     [[span class="lottery-name"]]
       <?php echo htmlspecialchars($state, ENT_QUOTES); ?>
     [[/span]]
@@ -4512,13 +4879,13 @@ uksort($__crrPresentSrcs, function ($a, $b) use ($__crrSourceOrder) {
 ?>
 
 <?php if (!empty($lotName)): ?>
-  &nbsp;•&nbsp;
+  &nbsp;â€¢&nbsp;
   [[span class="lottery-name"]]
     <?php echo htmlspecialchars($lotName, ENT_QUOTES); ?>
   [[/span]]
 <?php endif; ?>
 
-  &nbsp;•&nbsp;
+  &nbsp;â€¢&nbsp;
   <?php
     $ts = strtotime((string) ($g['draw_date'] ?? ''));
     echo $ts ? date('M j, Y', $ts) : htmlspecialchars((string) ($g['draw_date'] ?? ''), ENT_QUOTES);
@@ -4628,9 +4995,7 @@ $__drawExtra = [];
 
 if ($__drawRow) {
 
-$__mode = (!empty($__drawMain)) ? 'post' : 'pre';
-
-  // If row came from $drawMap, normalized fields exist (main_0, main_1, …, extra_ball)
+  // If row came from $drawMap, normalized fields exist (main_0, main_1, ..., extra_ball)
   $hasNormalizedMains = array_key_exists('main_0', $__drawRow);
 
   if ($hasNormalizedMains) {
@@ -4665,6 +5030,10 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
       }
   }
 }
+// Draw is considered "happened" when main numbers are present â€” extra ball is NOT used
+// as the completion signal because games with no extra ball (e.g. Gimme 5) would always
+// appear as pre-draw if we relied on $__drawExtra being non-empty.
+$__mode = (!empty($__drawMain)) ? 'post' : 'pre';
 
         // Limits: up to 20 main ranks, up to 5 extra ranks (safe defaults)
         $__maxRankMain  = 20;
@@ -4691,7 +5060,7 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
 
         // Helper: map number -> position (1-based) for a prediction string
         $toPositions = function (string $csv, int $limit) {
-          $arr = array_values(array_filter(array_map('trim', explode(',', $csv)), fn($v)=>$v!==''));
+          $arr = array_values(array_filter(array_map('trim', explode(',', $csv)), function($v) { return $v !== ''; }));
           $pos = [];
           foreach ($arr as $i => $n) {
             if ($i >= $limit) break;
@@ -5849,10 +6218,10 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
     [[br]][[br]]
     [[strong]]How to read it:[[/strong]]
     [[br]]
-    • The [[strong]]red side on the left (low rank numbers)[[/strong]] shows early picks.  
-    • The [[strong]]blue side on the right (high rank numbers)[[/strong]] shows later picks.  
-    • Darker cells mean [[em]]more hits[[/em]] at that rank.  
-    • Gold-outlined cells mark each method's current [[em]]"sweet-spot" ranks[[/em]].
+    â€¢ The [[strong]]red side on the left (low rank numbers)[[/strong]] shows early picks.  
+    â€¢ The [[strong]]blue side on the right (high rank numbers)[[/strong]] shows later picks.  
+    â€¢ Darker cells mean [[em]]more hits[[/em]] at that rank.  
+    â€¢ Gold-outlined cells mark each method's current [[em]]"sweet-spot" ranks[[/em]].
     [[br]][[br]]
 
 
@@ -5990,7 +6359,7 @@ $peakCols = array_values(array_filter($peakCols, function ($k) use ($placementSt
     [[span style="display:inline-block; width:16px; height:10px; background:#FF0000; margin-right:.35rem;"]][[/span]] Rank #1 (hot)
     &nbsp;?&nbsp;
     [[span style="display:inline-block; width:16px; height:10px; background:#0000FF; margin:0 .35rem 0 .55rem;"]][[/span]] Rank #<?php echo $__maxRankMain; ?> (cool)
-    &nbsp;•&nbsp; Gold outline = peak columns for that method
+    &nbsp;â€¢&nbsp; Gold outline = peak columns for that method
   [[/div]]
   
   <?php
@@ -6080,7 +6449,7 @@ $peakCols = array_values(array_filter($peakCols, function ($k) use ($placementSt
 
   [[div style="font-size:0.85rem; color:#4a5568; line-height:1.4;"]]
     [[strong]]Per-method pattern:[[/strong]]
-    [[em]]<?php echo htmlspecialchars(implode('  •  ', $perMethodSummaries), ENT_QUOTES); ?>[[/em]]
+    [[em]]<?php echo htmlspecialchars(implode('  â€¢  ', $perMethodSummaries), ENT_QUOTES); ?>[[/em]]
     [[br]]
     [[span style="opacity:0.9;"]]
       Tip: Aim to match more of your chosen numbers where methods score early (ranks #1-#5), and use later ranks as secondary numbers.
@@ -6238,10 +6607,11 @@ $when  = $ts ? date('c', $ts) : (string) $tsRaw; // ISO8601 for JS local-time co
                   $__tmp = array_values(array_filter(array_map('intval', explode(',', (string)$s->extra_ball_numbers))));
                   if (!empty($__tmp)) { $__cardPredExtra = (int)$__tmp[0]; }
               }
-              $__cardScored = getDrawAndScoreRun($db, $g['game_id'], $g['draw_date'], $__cardPredMain, $__cardPredExtra);
+              $__cardLotCfg = $configData['lotteries'][$g['game_id']] ?? [];
+              $__cardScored = resolveDrawNumbers($db, $g['game_id'], $g['draw_date'], $__cardLotCfg, $drawMap);
               // Convenience aliases used by display logic below
-              $drawMain  = $__cardScored['drawMain'];
-              $drawExtra = $__cardScored['drawExtra'];
+              $drawMain  = $__cardScored['main'];
+              $drawExtra = $__cardScored['extra'];
 
               $fields   = getDrawFields($g['game_id']);
               $mainCols = $fields['main']  ?? [];
@@ -6734,7 +7104,7 @@ if ($__rawSettingsJson !== null):
   [[input type="text"
           name="setting_name"
           value="<?php echo $defaultName; ?>"
-          placeholder="Save as template…"
+          placeholder="Save as template..."
           style="width:100%; padding:6px; margin-bottom:6px; font-size:.9rem;"]]
 
   [[button type="submit" class="btn-primary"
@@ -6845,7 +7215,7 @@ $savedSettings = $db->loadAssocList() ?: [];
             $sourceLabel = ucfirst(str_replace('_', ' ', $set['source']));
             $state       = htmlspecialchars($set['state_name'] ?? 'Unknown', ENT_QUOTES);
             $lotteryName = htmlspecialchars($set['lottery_name'] ?? 'Unknown', ENT_QUOTES);
-            echo "$sourceLabel for $state • $lotteryName";
+            echo "$sourceLabel for $state - $lotteryName";
           ?>
           [[br]]
           [[em]]<?php echo date('M j, Y g:ia', strtotime($set['created_at'])); ?>[[/em]]
@@ -6856,9 +7226,9 @@ $savedSettings = $db->loadAssocList() ?: [];
                 // human-friendly labels
                 $labels = [
                   'draws_analyzed'      => 'Draws',
-                  'freq_weight'         => 'Freq Wt',
-                  'skip_weight'         => 'Skip Wt',
-                  'hist_weight'         => 'Hist Wt',
+                  'freq_weight'         => 'Freq Wt',
+                  'skip_weight'         => 'Skip Wt',
+                  'hist_weight'         => 'Hist Wt',
                   'epochs'              => 'Epochs',
                   'batch_size'          => 'Batch',
                   'dropout_rate'        => 'Dropout',
@@ -6867,16 +7237,16 @@ $savedSettings = $db->loadAssocList() ?: [];
                   'hidden_layers'       => 'Layers',
                   'walks'               => 'Walks',
                   'burn_in'             => 'Burn-in',
-                  'laplace_k'           => 'Laplace K',
+                  'laplace_k'           => 'Laplace K',
                   'decay'               => 'Decay',
-                  'chain_len'           => 'Chain Len',
+                  'chain_len'           => 'Chain Len',
                 ];
                 $parts = [];
                 foreach ($params as $key => $val) {
                   $lbl = $labels[$key] ?? ucwords(str_replace('_',' ',$key));
                   $parts[] = htmlspecialchars($lbl, ENT_QUOTES) . ': ' . htmlspecialchars($val, ENT_QUOTES);
                 }
-                echo implode(' | ', $parts);
+                echo implode(' | ', $parts);
               ?>
             [[/div]]
           <?php endif; ?>
