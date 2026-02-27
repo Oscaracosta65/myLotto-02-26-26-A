@@ -2001,6 +2001,13 @@ function getDrawByDate($gameId, $date, $db)
  */
 function getExtraColFromConfig(array $lcfg): ?string
 {
+    // Respect the explicit has_extra_ball flag. When the config author sets it to
+    // false (e.g. Gimme 5) there is no extra ball regardless of what column names
+    // appear in the config, and we must return null so the game is not treated as
+    // an extra-ball game.
+    if (isset($lcfg['has_extra_ball']) && !$lcfg['has_extra_ball']) {
+        return null;
+    }
     // Singular key first (most common path).
     if (isset($lcfg['extra_ball_column']) && is_string($lcfg['extra_ball_column'])) {
         $col = trim($lcfg['extra_ball_column']);
@@ -4988,8 +4995,6 @@ $__drawExtra = [];
 
 if ($__drawRow) {
 
-$__mode = (!empty($__drawMain)) ? 'post' : 'pre';
-
   // If row came from $drawMap, normalized fields exist (main_0, main_1, ..., extra_ball)
   $hasNormalizedMains = array_key_exists('main_0', $__drawRow);
 
@@ -5025,6 +5030,10 @@ $__mode = (!empty($__drawMain)) ? 'post' : 'pre';
       }
   }
 }
+// Draw is considered "happened" when main numbers are present — extra ball is NOT used
+// as the completion signal because games with no extra ball (e.g. Gimme 5) would always
+// appear as pre-draw if we relied on $__drawExtra being non-empty.
+$__mode = (!empty($__drawMain)) ? 'post' : 'pre';
 
         // Limits: up to 20 main ranks, up to 5 extra ranks (safe defaults)
         $__maxRankMain  = 20;
