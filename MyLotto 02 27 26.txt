@@ -1363,16 +1363,12 @@ unset($__bavOpp);
 // ------------------------------------------------------------------
 // 7) Build per-lottery prediction-results summary for the comparison table.
 //    Groups ALL saved runs (scored + unscored) across all draw dates.
-//    Uses already-loaded $bestOpps, $groups and $savedSets – no DB queries.
+//
+//    ISOLATED: this section goes DIRECTLY to the database for actual draw
+//    data using lottery_skip_config.json to determine the table name and
+//    column layout for each game.  It does NOT depend on $bestOpps,
+//    $drawMap, or $__scoredByRunId from other sections.
 // ------------------------------------------------------------------
-
-// Quick lookup: run_id -> scored result (from all_scored_runs in $bestOpps)
-$__scoredByRunId = array();
-foreach ($bestOpps as $__lid => $__opp) {
-    foreach ($__opp['all_scored_runs'] as $__sr) {
-        $__scoredByRunId[(int)$__sr['run_id']] = $__sr;
-    }
-}
 
 // Quick lookup: run_id -> display name info (source, mode, label)
 $__runDispInfo = array();
@@ -1392,11 +1388,9 @@ foreach ($savedSets as $__s) {
     );
 }
 
-// Draw-fetch fallback cache: keyed by "game_id|Y-m-d".
-// Used when scoreRunFromDrawMap / $bestOpps['all_scored_runs'] did not score a run
-// (e.g. the UNION ALL path failed or was skipped for this lottery table).
-// Mirrors exactly what the per-prediction-card code does at render time.
-$__drawFallbackCache = array();
+// Draw cache keyed by "game_id|Y-m-d": populated once per game+date via
+// getDrawByDate() (direct DB) + getDrawFields() (config column names).
+$__prcDrawCache = array();
 
 // Group all runs per lottery_id
 $__runSummary = array();
@@ -1411,71 +1405,66 @@ foreach ($groups as $__gKey => $__g) {
             'best_run_id'  => 0,
         );
     }
-    // Normalise the group draw_date once.
+    // Normalise draw_date to Y-m-d for the cache key.
     $__gDateTs   = strtotime((string)($__g['draw_date'] ?? ''));
     $__gDateNorm = $__gDateTs ? date('Y-m-d', $__gDateTs) : (string)($__g['draw_date'] ?? '');
     $__fbCacheKey = (int)$__g['game_id'] . '|' . $__gDateNorm;
 
-    // ── Per-group direct DB fetch (same pattern as per-prediction-card, line 4900) ──
-    // This is the guaranteed primary source for actual drawn numbers.
-    // Cached by game_id|date so each game+date is only fetched once.
-    if (!array_key_exists($__fbCacheKey, $__drawFallbackCache)) {
+    // ── Direct DB fetch for this game + draw date (cached per game+date) ──
+    // Uses lottery_skip_config.json to discover the draw table name (dbCol)
+    // and the column layout (main_ball_columns, extra_ball_column) for the
+    // game.  getDrawByDate() queries with game_id + DATE(draw_date) and
+    // returns the raw table row; getDrawFields() gives the column names so
+    // we can extract the actual drawn numbers from that row.
+    if (!array_key_exists($__fbCacheKey, $__prcDrawCache)) {
         $__grpFields  = getDrawFields((int)$__g['game_id']);
         $__grpDrawRow = getDrawByDate((int)$__g['game_id'], (string)($__g['draw_date'] ?? ''), $db);
         $__grpMain    = array();
         $__grpExtra   = array();
         if ($__grpDrawRow) {
-            // Try normalized columns (main_0, …) first, then raw column names from config
-            if (array_key_exists('main_0', $__grpDrawRow)) {
-                for ($__gi = 0; $__gi < 25; $__gi++) {
-                    $__gk = 'main_' . $__gi;
-                    if (isset($__grpDrawRow[$__gk]) && $__grpDrawRow[$__gk] !== '' && $__grpDrawRow[$__gk] !== null) {
-                        $__gv = (int)$__grpDrawRow[$__gk];
-                        if ($__gv) { $__grpMain[] = $__gv; }
-                    }
-                }
-                if (isset($__grpDrawRow['extra_ball']) && $__grpDrawRow['extra_ball'] !== '' && $__grpDrawRow['extra_ball'] !== null) {
-                    $__gv = (int)$__grpDrawRow['extra_ball'];
-                    if ($__gv) { $__grpExtra[] = $__gv; }
-                }
-            } else {
-                // Raw row: use original column names from config (same as per-card section)
-                foreach (($__grpFields['main'] ?? array()) as $__gc) {
-                    if (isset($__grpDrawRow[$__gc]) && $__grpDrawRow[$__gc] !== '') {
-                        $__grpMain[] = (int)$__grpDrawRow[$__gc];
-                    }
-                }
-                if (!empty($__grpFields['extra']) && isset($__grpDrawRow[$__grpFields['extra']]) && $__grpDrawRow[$__grpFields['extra']] !== '') {
-                    $__grpExtra[] = (int)$__grpDrawRow[$__grpFields['extra']];
+            // Read main ball columns by their config-defined names
+            foreach (($__grpFields['main'] ?? array()) as $__gc) {
+                if (isset($__grpDrawRow[$__gc]) && $__grpDrawRow[$__gc] !== '' && $__grpDrawRow[$__gc] !== null) {
+                    $__gv = (int)$__grpDrawRow[$__gc];
+                    if ($__gv !== 0) { $__grpMain[] = $__gv; }
                 }
             }
+            // Read extra ball column (e.g. Powerball, Mega Ball) if configured
+            if (!empty($__grpFields['extra'])
+                && isset($__grpDrawRow[$__grpFields['extra']])
+                && $__grpDrawRow[$__grpFields['extra']] !== ''
+                && $__grpDrawRow[$__grpFields['extra']] !== null
+            ) {
+                $__gv = (int)$__grpDrawRow[$__grpFields['extra']];
+                if ($__gv !== 0) { $__grpExtra[] = $__gv; }
+            }
         }
-        $__drawFallbackCache[$__fbCacheKey] = array(
+        $__prcDrawCache[$__fbCacheKey] = array(
             'has_draw'  => !empty($__grpMain),
             'drawMain'  => $__grpMain,
             'drawExtra' => $__grpExtra,
         );
     }
-    $__grpDraw = $__drawFallbackCache[$__fbCacheKey];
+    $__grpDraw = $__prcDrawCache[$__fbCacheKey];
 
     foreach ($__g['preds'] as $__pred) {
         $__rid = (int)$__pred->id;
-        $__scored = isset($__scoredByRunId[$__rid]) ? $__scoredByRunId[$__rid] : null;
 
-        // Parse predicted numbers once; reused in both the fallback and the final entry.
+        // Parse predicted main numbers (skip zeros)
         $__predNums = array_values(array_filter(
             array_map('intval', explode(',', (string)($__pred->main_numbers ?? ''))),
             function ($n) { return $n !== 0; }
         ));
+        // Parse predicted extra ball (Powerball, Mega Ball, etc.)
         $__predExtra = 0;
         if (!empty($__pred->extra_ball_numbers)) {
             $__predExtraVals = array_values(array_filter(array_map('intval', explode(',', (string)$__pred->extra_ball_numbers))));
             if (!empty($__predExtraVals)) { $__predExtra = (int)$__predExtraVals[0]; }
         }
 
-        // ── If $__scoredByRunId did not have this run, use the per-group direct
-        //    DB fetch result ($__grpDraw) which mirrors the per-card section exactly.
-        if ($__scored === null && $__grpDraw['has_draw']) {
+        // ── Score against the direct-DB draw (the sole source for this section) ──
+        $__scored = null;
+        if ($__grpDraw['has_draw']) {
             $__fbMainHits  = 0;
             foreach ($__predNums as $__fn) {
                 if ($__fn !== 0 && in_array($__fn, $__grpDraw['drawMain'], true)) { $__fbMainHits++; }
@@ -1493,9 +1482,9 @@ foreach ($groups as $__gKey => $__g) {
             );
         }
 
-        $__mainHits   = ($__scored !== null) ? (int)$__scored['hits']          : null;
-        $__extraHits  = ($__scored !== null) ? (int)$__scored['extra_hits']   : null;
-        $__actualMain = ($__scored !== null) ? ($__scored['actual_main'] ?? array()) : array();
+        $__mainHits    = ($__scored !== null) ? (int)$__scored['hits']       : null;
+        $__extraHits   = ($__scored !== null) ? (int)$__scored['extra_hits'] : null;
+        $__actualMain  = ($__scored !== null) ? ($__scored['actual_main']  ?? array()) : array();
         $__actualExtra = ($__scored !== null) ? ($__scored['actual_extra'] ?? array()) : array();
         $__totalHits = (int)($__mainHits ?? 0) + (int)($__extraHits ?? 0);
         if ($__totalHits > $__runSummary[$__lid]['max_hits']) {
