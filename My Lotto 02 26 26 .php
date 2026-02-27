@@ -2292,6 +2292,137 @@ function getDrawAndScoreRun($db, $gameId, $drawDate, array $predMain, $predExtra
 }
 
 /**
+ * crrGetDrawNumbers: Reliably fetch actual drawn numbers for the CRR scoring loop.
+ *
+ * Three-layer fallback so regular lotteries (with or without configured column names)
+ * are scored correctly:
+ *   1. Use $drawMap (preloaded UNION result with normalized main_0/main_1/extra_ball keys)
+ *      -- but ONLY when the entry actually contains non-null main values.
+ *   2. Fall back to a direct SELECT * via getDrawByDate() which returns raw column names.
+ *      Then extract mains using configured column names from $tableInfo.
+ *   3. Auto-detect ball columns by name pattern (ball\d+, num\d+, n\d+, digit\d+, etc.)
+ *      when neither normalized keys nor configured names are available.
+ *
+ * Called once per lottery/date group, not once per prediction, for efficiency.
+ *
+ * @param  JDatabaseDriver  $db
+ * @param  int              $gameId
+ * @param  string           $normDate   Y-m-d (already normalized by the groups loop)
+ * @param  array            $drawMap    Preloaded draw map keyed "gameId|Y-m-d"
+ * @param  array            $tableInfo  Per-game config: ['main'=>[cols], 'extra'=>col|null]
+ * @return array            ['main'=>int[], 'extra'=>int, 'found'=>bool]
+ */
+function crrGetDrawNumbers($db, $gameId, $normDate, array $drawMap, array $tableInfo): array
+{
+    static $__crrCache = [];
+
+    $result  = ['main' => [], 'extra' => 0, 'found' => false];
+    $cacheKey = (int)$gameId . '|' . $normDate;
+
+    if (array_key_exists($cacheKey, $__crrCache)) {
+        return $__crrCache[$cacheKey];
+    }
+
+    $row = null;
+
+    // --- Layer 1: preloaded drawMap (normalized main_0/main_1 keys) ---
+    if (isset($drawMap[$cacheKey])) {
+        $candidate = $drawMap[$cacheKey];
+        // Only use if at least one main_N slot has a real (non-null, non-empty) value.
+        for ($i = 0; $i < 25; $i++) {
+            $k = 'main_' . $i;
+            if (array_key_exists($k, $candidate) && $candidate[$k] !== null && $candidate[$k] !== '') {
+                $row = $candidate;
+                break;
+            }
+        }
+    }
+
+    // --- Layer 2: direct SELECT * via getDrawByDate (raw column names) ---
+    if ($row === null) {
+        $row = getDrawByDate($gameId, $normDate, $db);
+    }
+
+    if (!$row) {
+        $__crrCache[$cacheKey] = $result;
+        return $result;
+    }
+
+    // --- Extract main numbers ---
+    $main    = [];
+    $hasNorm = array_key_exists('main_0', $row);
+
+    if ($hasNorm) {
+        // Normalized row from drawMap
+        for ($i = 0; $i < 25; $i++) {
+            $k = 'main_' . $i;
+            if (isset($row[$k]) && $row[$k] !== '' && $row[$k] !== null) {
+                $v = (int)$row[$k];
+                if ($v > 0) $main[] = $v;
+            }
+        }
+    }
+
+    // Try configured column names (works for raw rows; also covers drawMap rows
+    // that happen to include original column names alongside normalized aliases)
+    if (empty($main)) {
+        $mainCols = $tableInfo[(int)$gameId]['main'] ?? [];
+        foreach ($mainCols as $col) {
+            if (isset($row[$col]) && $row[$col] !== '' && $row[$col] !== null) {
+                $v = (int)$row[$col];
+                if ($v > 0) $main[] = $v;
+            }
+        }
+    }
+
+    // --- Layer 3: auto-detect ball columns by name pattern ---
+    if (empty($main)) {
+        $__skipCols = ['id', 'game_id', 'draw_id', 'lottery_id', 'draw_number', 'extra_ball'];
+        $__autoMain = [];
+        foreach ($row as $col => $val) {
+            $cl = strtolower((string)$col);
+            if (in_array($cl, $__skipCols, true)) continue;
+            if (strpos($cl, 'date') !== false || strpos($cl, 'time') !== false || strpos($cl, 'year') !== false) continue;
+            if (strpos($cl, 'jackpot') !== false || strpos($cl, 'prize') !== false
+                || strpos($cl, 'winner') !== false || strpos($cl, 'multiplier') !== false) continue;
+            if (strpos($cl, 'extra') !== false || strpos($cl, 'bonus') !== false
+                || strpos($cl, 'power') !== false || strpos($cl, 'mega') !== false) continue;
+            if (!preg_match('/^(ball|num|number|n|b|d|digit)\d+$/i', (string)$col)
+                && !preg_match('/^(winning_)?numbers?_?\d+$/i', (string)$col)) continue;
+            if ($val !== null && $val !== '') {
+                $v = (int)$val;
+                if ($v > 0) $__autoMain[$col] = $v;
+            }
+        }
+        ksort($__autoMain); // keep columns in schema order (ball1 < ball2 < ball3)
+        $main = array_values($__autoMain);
+    }
+
+    if (empty($main)) {
+        $__crrCache[$cacheKey] = $result;
+        return $result;
+    }
+
+    // --- Extract extra ball ---
+    $extra     = 0;
+    $extraCol  = $tableInfo[(int)$gameId]['extra'] ?? null;
+
+    // Normalized key first (present in drawMap rows)
+    if (array_key_exists('extra_ball', $row) && $row['extra_ball'] !== null && $row['extra_ball'] !== '') {
+        $extra = (int)$row['extra_ball'];
+    }
+    // Raw column name from config (present in getDrawByDate rows)
+    if ($extra === 0 && $extraCol !== null && $extraCol !== 'extra_ball'
+        && isset($row[$extraCol]) && $row[$extraCol] !== '' && $row[$extraCol] !== null) {
+        $extra = (int)$row[$extraCol];
+    }
+
+    $result = ['main' => $main, 'extra' => $extra, 'found' => true];
+    $__crrCache[$cacheKey] = $result;
+    return $result;
+}
+
+/**
  * Map a US state/territory name ? USPS abbreviation (uppercase).
  * Falls back to first two letters if unknown. Input may be mixed case.
  */
@@ -2799,7 +2930,12 @@ foreach ($groups as $groupKey => $g) {
         }
     }
 
-    // -- Rank Strength (Top-Hits Ranking): reward hits; tie-break by rank_score & run_id --
+    // -- Rank Strength (Top-Hits Ranking): fetch draw once per group, score each prediction --
+    $__grpDraw     = crrGetDrawNumbers($db, (int)$g['game_id'], (string)$g['draw_date'], $drawMap, $tableInfo);
+    $__grpDrawMain = $__grpDraw['main'];
+    $__grpDrawExtra = $__grpDraw['extra'];
+    $__grpHasDraw  = $__grpDraw['found'];
+
     foreach ($g['preds'] as $s) {
         // Extract predicted main numbers (zeros filtered out)
         $predMain = array_values(
@@ -2822,26 +2958,34 @@ foreach ($groups as $groupKey => $g) {
             $predExtra = (int)$s->bonus_number;
         }
 
-        // Single source-of-truth: same draw lookup + hit computation as prediction cards
-        $__scored = getDrawAndScoreRun($db, (int)$g['game_id'], (string)$g['draw_date'], $predMain, $predExtra, $drawMap);
-        if (!$__scored['has_draw']) {
-            // Track awaiting run for debug output
+        if (!$__grpHasDraw) {
+            // Draw not yet available; track for debug output and skip
             if ($__debugHits) {
                 $bestOpps[$lid]['awaiting_debug'][] = [
                     'run_id'    => (int)$s->id,
                     'game_id'   => (int)$g['game_id'],
                     'norm_date' => (string)$g['draw_date'],
                     'source'    => (string)$s->source,
-                    'reason'    => (string)($__scored['reason'] ?? 'unknown'),
+                    'reason'    => 'awaiting: draw not found',
                 ];
             }
-            continue; // draw not yet available; run stays in "awaiting" bucket
+            continue;
         }
 
-        $mainHitCount  = $__scored['hits_main'];
-        $extraHitCount = $__scored['hits_extra'];
-        $actualMain    = $__scored['drawMain'];
-        $actualExtra   = $__scored['drawExtra'][0] ?? 0;
+        $actualMain  = $__grpDrawMain;
+        $actualExtra = $__grpDrawExtra;
+
+        // Score hits directly against pre-fetched draw numbers
+        $mainHitCount = 0;
+        foreach ($predMain as $n) {
+            if ($n !== 0 && in_array($n, $actualMain, true)) {
+                $mainHitCount++;
+            }
+        }
+        $extraHitCount = 0;
+        if ($predExtra > 0 && $actualExtra > 0 && (int)$predExtra === $actualExtra) {
+            $extraHitCount = 1;
+        }
 
         // Position sum for tie-breaking within equal hit counts
         $posSum = 0;
